@@ -1,0 +1,109 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ===== Virtual Environment =====
+# conda环境
+cgenv/
+# 其他虚拟环境
+venv/
+env/
+ENV/
+
+# ===== macOS 特有 =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ===== IDE/编辑器 =====
+# VS Code
+.vscode/
+.history/
+
+# PyCharm
+.idea/
+*.iml
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+
+# ===== Flask 相关 =====
+instance/
+.webassets-cache
+.coverage
+htmlcov/
+
+# ===== 数据库 =====
+*.db
+*.sqlite3
+*.sqlite
+
+# ===== 日志文件 =====
+*.log
+logs/
+
+# ===== 环境变量文件 =====
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+
+
+# ===== 上传文件 =====
+uploads/
+static/uploads/
+
+# ===== 临时文件 =====
+*.tmp
+*.temp
+.cache/
+
+# ===== 备份文件 =====
+*.bak
+*.backup
+
+# ===== 压缩文件 =====
+*.zip
+*.tar.gz
+*.rar
+
+# ===== 项目特定 =====
+# 如果有配置文件包含敏感信息
+config_local.py
+secrets.py
