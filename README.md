@@ -10,3 +10,17 @@ python app.py
 
 3. 访问测试
 # http://localhost:5000
+```
+charging_station_system
+├─ 📁api
+│  ├─ 📄__init__.py
+│  ├─ 📄admin.py
+│  ├─ 📄charging.py
+│  └─ 📄user.py
+├─ 📄.env.example
+├─ 📄.gitignore
+├─ 📄README.md
+├─ 📄app.py
+├─ 📄config.py
+└─ 📄requirements.txt
+```
