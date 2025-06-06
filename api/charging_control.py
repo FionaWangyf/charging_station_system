@@ -1311,3 +1311,4 @@ class ChargingControlManager:
         scheduler_core.end_charging(pile_id) # 告诉引擎停止此充电桩的当前活动。
         # 进一步处理（数据库状态、费用）由'handle_engine_charging_end'处理
         # 当从引擎收到'charging_end'事件时。
+        

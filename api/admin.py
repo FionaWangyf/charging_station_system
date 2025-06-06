@@ -504,22 +504,17 @@ def force_sync_system():
         
         # 执行强制状态同步
         charging_manager.force_sync_engine_pile_states()
-        
         # 检查超时会话
         charging_manager.check_and_recover_timeout_completing_sessions()
-        
         # 处理等候区到引擎的转移
         charging_manager.process_station_waiting_area_to_engine()
-        
         # 广播状态更新
         charging_manager.broadcast_status_update()
-        
         return jsonify({
             'success': True,
             'message': '系统状态同步完成',
             'timestamp': datetime.now().isoformat()
         })
-        
     except Exception as e:
         print(f"强制同步系统状态错误: {e}")
         return jsonify({'success': False, 'message': '系统错误'}), 500
