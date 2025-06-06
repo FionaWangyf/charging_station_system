@@ -59,6 +59,11 @@ def register_routes(app, socketio):
     app.register_blueprint(charging_bp)
     print("✓ 充电控制与业务流程模块已注册")
 
+    # 注册管理员相关API
+    from api.admin import admin_bp
+    app.register_blueprint(admin_bp)
+    print("✓ 管理员模块已注册")
+
 # 创建应用实例
 app, socketio = create_app()
 
