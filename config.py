@@ -13,7 +13,12 @@ class Config:
     MYSQL_USERNAME = os.environ.get('MYSQL_USERNAME') or 'root'
     MYSQL_PASSWORD = os.environ.get('MYSQL_PASSWORD') or 'password'
     DATABASE_URL = f"mysql://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@localhost/charging_station"
-    
+    MYSQL_HOST = 'localhost'
+    MYSQL_PORT = int(3306)
+    MYSQL_USER = 'root'
+    MYSQL_PASSWORD = '123456'
+    MYSQL_DATABASE = 'charging_station'    
+
     # 系统配置（这些可以公开）
     FAST_CHARGING_PILES = 2
     SLOW_CHARGING_PILES = 3
@@ -21,13 +26,7 @@ class Config:
 
     # Flask配置
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'charging_station_secret_key'
-    
-    # MySQL配置
-    MYSQL_HOST = 'localhost'
-    MYSQL_PORT = int(3306)
-    MYSQL_USER = 'root'
-    MYSQL_PASSWORD = '123456'
-    MYSQL_DATABASE = 'charging_station'
+
     
     # Redis配置
     REDIS_HOST = os.environ.get('REDIS_HOST') or 'localhost'
