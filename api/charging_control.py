@@ -23,42 +23,49 @@ class ChargingControlManager:
         
         self.init_redis_data()
         self.init_piles_in_engine()
-
+    
         print("启动时执行状态同步检查...")
         self.startup_state_sync()
-
-        # 原有的定时任务
-        self.scheduler.add_job(
-            func=self.poll_and_process_engine_events,
-            trigger="interval",
-            seconds=2,
-            id='engine_event_poller'
-        )
-        
-        self.scheduler.add_job(
-            func=self.monitor_charging_progress,
-            trigger="interval",
-            seconds=10,
-            id='charging_monitor'
-        )
-
-        self.scheduler.add_job(
-            func=self.process_station_waiting_area_to_engine,
-            trigger="interval",
-            seconds=5,
-            id='station_to_engine_queue_processor'
-        )
-        
-        # 新添加：超时检查任务
-        self.scheduler.add_job(
-            func=self.check_and_recover_timeout_completing_sessions,
-            trigger="interval",
-            seconds=30,  # 每30秒检查一次超时会话
-            id='timeout_completing_checker'
-        )
-        
+    
+        # 定义所有定时任务
+        jobs = [
+            {
+                "id": "engine_event_poller",
+                "func": self.poll_and_process_engine_events,
+                "trigger": "interval",
+                "seconds": 2
+            },
+            {
+                "id": "charging_monitor",
+                "func": self.monitor_charging_progress,
+                "trigger": "interval",
+                "seconds": 10,
+                "misfire_grace_time": 5
+            },
+            {
+                "id": "station_to_engine_queue_processor",
+                "func": self.process_station_waiting_area_to_engine,
+                "trigger": "interval",
+                "seconds": 5,
+                "misfire_grace_time": 3
+            },
+            {
+                "id": "timeout_completing_checker",
+                "func": self.check_and_recover_timeout_completing_sessions,
+                "trigger": "interval",
+                "seconds": 60,
+                "misfire_grace_time": 10
+            }
+        ]
+    
+        # 添加前先移除同名任务，避免重复
+        for job in jobs:
+            if self.scheduler.get_job(job["id"]):
+                self.scheduler.remove_job(job["id"])
+            self.scheduler.add_job(**job)
+    
         scheduler_core.start_dispatch_loop()
-        
+    
         print("=" * 60)
         print("充电控制管理器已启动，包含超时恢复机制")
         print("=" * 60)
@@ -585,100 +592,115 @@ class ChargingControlManager:
                 self.update_pile_redis_status(pile_id, PileStatus.IDLE.value, None)
 
     def check_and_recover_timeout_completing_sessions(self):
-        """检查和恢复超时的completing状态会话，并确保引擎状态同步"""
+        """检查和恢复超时的completing状态会话，修复连接泄漏问题"""
+        # 使用Redis锁防止并发执行
+        redis_client = self.db.get_redis_client()
+        lock_key = "timeout_check_lock"
+        
+        # 尝试获取锁，如果无法获取说明另一个实例正在执行
+        if not redis_client.set(lock_key, "processing", nx=True, ex=15):
+            return
+        
         try:
-            connection = self.db.get_mysql_connection()
-            cursor = connection.cursor(dictionary=True)
-            
-            # 查找超过60秒仍在completing状态的会话
-            timeout_threshold = datetime.now() - timedelta(seconds=60)
-            cursor.execute("""
-                SELECT session_id, pile_id, user_id, start_time, actual_amount, charging_duration
-                FROM charging_sessions 
-                WHERE status = 'completing' AND start_time < %s
-            """, (timeout_threshold,))
-            
-            timeout_sessions = cursor.fetchall()
-            
-            for session in timeout_sessions:
-                session_id = session['session_id']
-                pile_id = session['pile_id']
-                user_id = session['user_id']
+            # 使用上下文管理器确保连接正确释放
+            with self.db.get_cursor() as (cursor, connection):
+                # 调整超时时间：测试模式下使用更长的超时时间
+                timeout_seconds = 180 if (hasattr(Config, 'TESTING_MODE') and Config.TESTING_MODE) else 60
+                timeout_threshold = datetime.now() - timedelta(seconds=timeout_seconds)
                 
-                print(f"检测到超时的completing会话: {session_id}，强制完成处理")
-                
-                # 计算费用
-                actual_amount = float(session.get('actual_amount', 0))
-                charging_duration_hours = float(session.get('charging_duration', 0))
-                start_time = session.get('start_time')
-                
-                fees = self.calculate_charging_fees(session_id, actual_amount, start_time, datetime.now())
-                
-                # 强制完成会话
                 cursor.execute("""
-                    UPDATE charging_sessions 
-                    SET status = 'completed', end_time = %s,
-                        charging_fee = %s, service_fee = %s, total_fee = %s
-                    WHERE session_id = %s
-                """, (datetime.now(), fees['charging_fee'], fees['service_fee'], fees['total_fee'], session_id))
+                    SELECT session_id, pile_id, user_id, start_time, actual_amount, charging_duration
+                    FROM charging_sessions 
+                    WHERE status = 'completing' AND start_time < %s
+                """, (timeout_threshold,))
                 
-                # 更新充电桩统计
-                if pile_id:
+                timeout_sessions = cursor.fetchall()
+                
+                if not timeout_sessions:
+                    return  # 没有超时会话，直接返回
+                
+                print(f"发现 {len(timeout_sessions)} 个超时的completing会话，开始恢复...")
+                
+                recovered_count = 0
+                for session in timeout_sessions:
+                    session_id = session['session_id']
+                    pile_id = session['pile_id']
+                    user_id = session['user_id']
+                    
+                    # 双重检查：确保会话仍然是completing状态
+                    cursor.execute("SELECT status FROM charging_sessions WHERE session_id = %s", (session_id,))
+                    current_status = cursor.fetchone()
+                    
+                    if not current_status or current_status['status'] != 'completing':
+                        print(f"会话 {session_id} 状态已改变，跳过恢复")
+                        continue
+                    
+                    print(f"恢复超时会话: {session_id}")
+                    
+                    # 计算费用
+                    actual_amount = float(session.get('actual_amount', 0))
+                    charging_duration_hours = float(session.get('charging_duration', 0))
+                    start_time = session.get('start_time')
+                    
+                    fees = self.calculate_charging_fees(session_id, actual_amount, start_time, datetime.now())
+                    
+                    # 强制完成会话
                     cursor.execute("""
-                        UPDATE charging_piles 
-                        SET total_charging_count = total_charging_count + 1,
-                            total_charging_time = total_charging_time + %s,
-                            total_charging_amount = total_charging_amount + %s
-                        WHERE id = %s
-                    """, (charging_duration_hours, actual_amount, pile_id))
+                        UPDATE charging_sessions 
+                        SET status = 'completed', end_time = %s,
+                            charging_fee = %s, service_fee = %s, total_fee = %s
+                        WHERE session_id = %s AND status = 'completing'
+                    """, (datetime.now(), fees['charging_fee'], fees['service_fee'], fees['total_fee'], session_id))
                     
-                    # 关键修复：强制通知引擎结束充电，确保引擎状态同步
-                    print(f"强制通知引擎结束充电桩 {pile_id} 的充电以同步状态")
-                    try:
-                        scheduler_core.end_charging(pile_id)
-                        # 给引擎一点时间处理
-                        import time
-                        time.sleep(0.5)
-                    except Exception as engine_error:
-                        print(f"通知引擎结束充电时出错: {engine_error}")
+                    # 检查是否真的更新了（避免并发问题）
+                    if cursor.rowcount > 0:
+                        recovered_count += 1
+                        
+                        # 更新充电桩统计
+                        if pile_id:
+                            cursor.execute("""
+                                UPDATE charging_piles 
+                                SET total_charging_count = total_charging_count + 1,
+                                    total_charging_time = total_charging_time + %s,
+                                    total_charging_amount = total_charging_amount + %s
+                                WHERE id = %s
+                            """, (charging_duration_hours, actual_amount, pile_id))
+                            
+                            # 通知引擎同步状态
+                            try:
+                                scheduler_core.end_charging(pile_id)
+                            except Exception as engine_error:
+                                print(f"通知引擎结束充电时出错: {engine_error}")
+                            
+                            self.update_pile_redis_status(pile_id, PileStatus.IDLE.value, None)
+                        
+                        # 清理Redis状态
+                        redis_client.delete(f"session_status:{session_id}")
+                        redis_client.delete(f"session_completing:{session_id}")
+                        
+                        # 通知用户
+                        if user_id:
+                            self.socketio.emit('user_specific_event', {
+                                'message': f'您的充电会话已完成。总费用: {fees["total_fee"]:.2f}元。',
+                                'type': 'charging_completed_recovery',
+                                'session_id': session_id,
+                                'total_fee': fees['total_fee'],
+                                'actual_amount': actual_amount
+                            }, room=f'user_{user_id}')
+                
+                if recovered_count > 0:
+                    print(f"成功恢复了 {recovered_count} 个超时会话")
+                    # 只在有恢复时才进行状态同步和广播
+                    self.broadcast_status_update()
+                    self.process_station_waiting_area_to_engine()
                     
-                    # 无论引擎是否响应，都要更新应用状态
-                    self.update_pile_redis_status(pile_id, PileStatus.IDLE.value, None)
-                
-                connection.commit()
-                
-                # 清理Redis状态
-                redis_client = self.db.get_redis_client()
-                redis_client.delete(f"session_status:{session_id}")
-                redis_client.delete(f"session_completing:{session_id}")
-                
-                # 通知用户
-                if user_id:
-                    self.socketio.emit('user_specific_event', {
-                        'message': f'您的充电会话 {session_id} 已完成（系统恢复）。总费用: {fees["total_fee"]:.2f}元。',
-                        'type': 'charging_completed_recovery',
-                        'session_id': session_id,
-                        'total_fee': fees['total_fee'],
-                        'actual_amount': actual_amount
-                    }, room=f'user_{user_id}')
-                    
-                # 触发队列处理
-                self.process_station_waiting_area_to_engine()
-            
-            cursor.close()
-            connection.close()
-            
-            if timeout_sessions:
-                print(f"恢复了 {len(timeout_sessions)} 个超时的completing会话")
-                # 额外检查：强制同步所有充电桩状态
-                self.force_sync_engine_pile_states()
-                self.broadcast_status_update()
-                
         except Exception as e:
             print(f"检查超时completing会话错误: {e}")
             import traceback
             traceback.print_exc()
-
+        finally:
+            # 释放锁
+            redis_client.delete(lock_key)
     def force_sync_engine_pile_states(self):
         """强制同步引擎与应用的充电桩状态"""
         try:
@@ -936,105 +958,100 @@ class ChargingControlManager:
                                    room=f'user_{user_id}')
 
     def monitor_charging_progress(self):
+        """监控充电进度，修复连接泄漏问题"""
         try:
             with self.lock:
-                connection = self.db.get_mysql_connection()
-                cursor = connection.cursor(dictionary=True)
+                with self.db.get_cursor() as (cursor, connection):
+                    cursor.execute("""
+                        SELECT s.session_id, s.pile_id, s.user_id, s.requested_amount, s.actual_amount AS current_actual_amount, s.start_time,
+                            p.power AS pile_power 
+                        FROM charging_sessions s
+                        JOIN charging_piles p ON s.pile_id = p.id
+                        WHERE s.status = 'charging' 
+                    """)
+                    active_sessions = cursor.fetchall()
 
-                cursor.execute("""
-                    SELECT s.session_id, s.pile_id, s.user_id, s.requested_amount, s.actual_amount AS current_actual_amount, s.start_time,
-                        p.power AS pile_power 
-                    FROM charging_sessions s
-                    JOIN charging_piles p ON s.pile_id = p.id
-                    WHERE s.status = 'charging' 
-                """)
-                active_sessions = cursor.fetchall()
+                    sessions_to_update_in_db = []
+                    sessions_completed_flags = {}
 
-                sessions_to_update_in_db = []
-                sessions_completed_flags = {}
+                    for session in active_sessions:
+                        session_id = session['session_id']
+                        pile_id = session['pile_id']
+                        pile_power = float(session['pile_power'])
+                        requested_kwh = float(session['requested_amount'])
+                        current_actual_kwh = float(session['current_actual_amount'] or 0)
+                        start_time = session['start_time']
 
-                for session in active_sessions:
-                    session_id = session['session_id']
-                    pile_id = session['pile_id']
-                    pile_power = float(session['pile_power'])
-                    requested_kwh = float(session['requested_amount'])
-                    current_actual_kwh = float(session['current_actual_amount'] or 0)
-                    start_time = session['start_time']
-
-                    if not start_time:
-                        print(f"警告: 会话 {session_id} (用户 {session['user_id']}) 状态为'charging'但没有start_time。")
-                        continue
-                    
-                    elapsed_seconds = (datetime.now() - start_time).total_seconds()
-                    if elapsed_seconds < 0: elapsed_seconds = 0
-                    elapsed_hours = elapsed_seconds / 3600.0
-                    
-                    # 应用测试模式的速度调整
-                    effective_pile_power = pile_power
-                    if hasattr(Config, 'TESTING_MODE') and Config.TESTING_MODE:
-                        effective_pile_power = pile_power * Config.CHARGING_SPEED_FACTOR
-                    
-                    potential_total_charged_by_time = elapsed_hours * effective_pile_power
-                    new_actual_kwh = min(potential_total_charged_by_time, requested_kwh)
-                    new_actual_kwh = round(new_actual_kwh, 4)
-                    
-                    if new_actual_kwh > current_actual_kwh or current_actual_kwh == 0:
-                        sessions_to_update_in_db.append({
-                            'session_id': session_id,
-                            'actual_amount': new_actual_kwh,
-                            'charging_duration': round(elapsed_hours, 4)
-                        })
-                        self.db.get_redis_client().hset(f"session_status:{session_id}", "actual_amount", str(new_actual_kwh))
-                        self.db.get_redis_client().hset(f"session_status:{session_id}", "charging_duration", str(round(elapsed_hours, 4)))
-
-                    if new_actual_kwh >= requested_kwh:
-                        redis_client = self.db.get_redis_client()
-                        completion_key = f"session_completing:{session_id}"
+                        if not start_time:
+                            print(f"警告: 会话 {session_id} (用户 {session['user_id']}) 状态为'charging'但没有start_time。")
+                            continue
                         
-                        is_first_completion_attempt = redis_client.set(completion_key, "processing", nx=True, ex=30)
+                        elapsed_seconds = (datetime.now() - start_time).total_seconds()
+                        if elapsed_seconds < 0: elapsed_seconds = 0
+                        elapsed_hours = elapsed_seconds / 3600.0
                         
-                        if is_first_completion_attempt:
-                            print(f"会话 {session_id} 在充电桩 {pile_id} 达到请求电量 ({new_actual_kwh}/{requested_kwh})。通过引擎结束充电。")
-                            sessions_completed_flags[session_id] = True
+                        # 应用测试模式的速度调整
+                        effective_pile_power = pile_power
+                        if hasattr(Config, 'TESTING_MODE') and Config.TESTING_MODE:
+                            effective_pile_power = pile_power * Config.CHARGING_SPEED_FACTOR
+                        
+                        potential_total_charged_by_time = elapsed_hours * effective_pile_power
+                        new_actual_kwh = min(potential_total_charged_by_time, requested_kwh)
+                        new_actual_kwh = round(new_actual_kwh, 4)
+                        
+                        if new_actual_kwh > current_actual_kwh or current_actual_kwh == 0:
+                            sessions_to_update_in_db.append({
+                                'session_id': session_id,
+                                'actual_amount': new_actual_kwh,
+                                'charging_duration': round(elapsed_hours, 4)
+                            })
+                            self.db.get_redis_client().hset(f"session_status:{session_id}", "actual_amount", str(new_actual_kwh))
+                            self.db.get_redis_client().hset(f"session_status:{session_id}", "charging_duration", str(round(elapsed_hours, 4)))
+
+                        if new_actual_kwh >= requested_kwh:
+                            redis_client = self.db.get_redis_client()
+                            completion_key = f"session_completing:{session_id}"
                             
-                            cursor.execute("""
-                                UPDATE charging_sessions 
-                                SET status = 'completing'
-                                WHERE session_id = %s AND status = 'charging'
-                            """, (session_id,))
-                            connection.commit()
+                            is_first_completion_attempt = redis_client.set(completion_key, "processing", nx=True, ex=30)
                             
-                            # 调用引擎结束充电，并添加重试机制
-                            try:
-                                scheduler_core.end_charging(pile_id)
-                                print(f"已向引擎发送end_charging指令: {pile_id}")
-                            except Exception as engine_error:
-                                print(f"向引擎发送end_charging指令失败: {engine_error}")
-                                # 如果引擎调用失败，标记为需要强制完成
-                                redis_client.set(f"force_complete:{session_id}", "true", ex=60)
-                        else:
-                            print(f"会话 {session_id} 已在完成处理中，跳过重复的end_charging调用。")
+                            if is_first_completion_attempt:
+                                print(f"会话 {session_id} 在充电桩 {pile_id} 达到请求电量 ({new_actual_kwh}/{requested_kwh})。通过引擎结束充电。")
+                                sessions_completed_flags[session_id] = True
+                                
+                                cursor.execute("""
+                                    UPDATE charging_sessions 
+                                    SET status = 'completing'
+                                    WHERE session_id = %s AND status = 'charging'
+                                """, (session_id,))
+                                
+                                # 调用引擎结束充电，并添加重试机制
+                                try:
+                                    scheduler_core.end_charging(pile_id)
+                                    print(f"已向引擎发送end_charging指令: {pile_id}")
+                                except Exception as engine_error:
+                                    print(f"向引擎发送end_charging指令失败: {engine_error}")
+                                    # 如果引擎调用失败，标记为需要强制完成
+                                    redis_client.set(f"force_complete:{session_id}", "true", ex=60)
+                            else:
+                                print(f"会话 {session_id} 已在完成处理中，跳过重复的end_charging调用。")
                     
-                if sessions_to_update_in_db:
-                    update_query = """
-                        UPDATE charging_sessions 
-                        SET actual_amount = %s, charging_duration = %s
-                        WHERE session_id = %s AND status = 'charging'
-                    """
-                    update_data = [(s['actual_amount'], s['charging_duration'], s['session_id']) for s in sessions_to_update_in_db]
-                    cursor.executemany(update_query, update_data)
-                    connection.commit()
-                
-                cursor.close()
-                connection.close()
-                
-                if sessions_to_update_in_db or sessions_completed_flags:
-                    self.broadcast_status_update()
+                    if sessions_to_update_in_db:
+                        update_query = """
+                            UPDATE charging_sessions 
+                            SET actual_amount = %s, charging_duration = %s
+                            WHERE session_id = %s AND status = 'charging'
+                        """
+                        update_data = [(s['actual_amount'], s['charging_duration'], s['session_id']) for s in sessions_to_update_in_db]
+                        cursor.executemany(update_query, update_data)
+                    
+                    if sessions_to_update_in_db or sessions_completed_flags:
+                        self.broadcast_status_update()
 
         except Exception as e:
             print(f"monitor_charging_progress错误: {e}")
             import traceback
             traceback.print_exc()
+
     def calculate_charging_fees(self, session_id: str, actual_amount: float, start_time: Optional[datetime], end_time: Optional[datetime]) -> Dict[str, float]:
         if actual_amount <= 0 or not start_time or not end_time or start_time >= end_time:
              return {'charging_fee': 0.0, 'service_fee': 0.0, 'total_fee': 0.0}
@@ -1100,26 +1117,29 @@ class ChargingControlManager:
         return (current_dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
     def get_session_details_from_db(self, session_id: str) -> Optional[Dict]:
-        connection = self.db.get_mysql_connection()
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM charging_sessions WHERE session_id = %s", (session_id,))
-        session = cursor.fetchone()
-        cursor.close()
-        connection.close()
-        return session
-
+        """获取会话详情，使用上下文管理器"""
+        try:
+            with self.db.get_cursor() as (cursor, connection):
+                cursor.execute("SELECT * FROM charging_sessions WHERE session_id = %s", (session_id,))
+                session = cursor.fetchone()
+                return session
+        except Exception as e:
+            print(f"获取会话详情错误: {e}")
+            return None
     def get_user_active_session_details(self, user_id: int) -> Optional[Dict]:
-        connection = self.db.get_mysql_connection()
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT * FROM charging_sessions 
-            WHERE user_id = %s AND status NOT IN ('completed', 'cancelled', 'fault_completed')
-            ORDER BY created_at DESC LIMIT 1
-        """, (user_id,))
-        session = cursor.fetchone()
-        cursor.close()
-        connection.close()
-        return session
+        """获取用户活跃会话详情，使用上下文管理器"""
+        try:
+            with self.db.get_cursor() as (cursor, connection):
+                cursor.execute("""
+                    SELECT * FROM charging_sessions 
+                    WHERE user_id = %s AND status NOT IN ('completed', 'cancelled', 'fault_completed')
+                    ORDER BY created_at DESC LIMIT 1
+                """, (user_id,))
+                session = cursor.fetchone()
+                return session
+        except Exception as e:
+            print(f"获取用户活跃会话错误: {e}")
+            return None
         
     def get_active_session_on_pile(self, pile_id: str) -> Optional[Dict]:
         connection = self.db.get_mysql_connection()
@@ -1149,13 +1169,23 @@ class ChargingControlManager:
             pipe.execute()
 
     def broadcast_status_update(self):
+        """优化的状态更新广播，减少不必要的事件"""
         try:
+            # 添加防抖机制，避免短时间内重复广播
+            redis_client = self.db.get_redis_client()
+            broadcast_lock_key = "broadcast_lock"
+            
+            # 如果1秒内已经广播过，跳过本次广播
+            if redis_client.exists(broadcast_lock_key):
+                return
+            
+            redis_client.set(broadcast_lock_key, "1", ex=1)  # 1秒内防重复
+            
             status_data = self.get_system_status_for_ui()
             self.socketio.emit('status_update', status_data, namespace='/')
+            
         except Exception as e:
             print(f"广播状态更新错误: {e}")
-            import traceback
-            traceback.print_exc()
     
     def get_system_status_for_ui(self) -> Dict:
         redis_client = self.db.get_redis_client()

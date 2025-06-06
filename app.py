@@ -1,5 +1,5 @@
 from flask import Flask
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, join_room, emit
 from flask_cors import CORS
 import os
 
@@ -35,6 +35,15 @@ def create_app():
     # 注册API路由
     register_routes(app, socketio)
     
+    # 集成socketio事件
+    @socketio.on('join')
+    def handle_join(data):
+        user_id = data.get('user_id')
+        room = f'user_{user_id}'
+        join_room(room)
+        print(f"✅ user {user_id} joined room: {room}")
+        emit('user_specific_event', {'msg': f'joined room {room}'}, room=room)  # 可选确认推送
+
     return app, socketio
 
 def register_routes(app, socketio):

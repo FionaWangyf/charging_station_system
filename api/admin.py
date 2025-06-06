@@ -148,3 +148,19 @@ def reset_pile_state():
             'success': False,
             'message': f'重置失败: {str(e)}'
         }), 500
+    
+@admin_bp.route('/api/admin/db_pool_status', methods=['GET'])
+def get_db_pool_status():
+    """获取数据库连接池状态"""
+    charging_manager = current_app.extensions['charging_manager']
+    try:
+        pool_status = charging_manager.db.get_pool_status()
+        return jsonify({
+            'success': True,
+            'data': pool_status
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'获取连接池状态失败: {str(e)}'
+        }), 500
