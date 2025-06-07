@@ -53,14 +53,25 @@ class Config:
         'min_power_per_charge': 0.1            # 单次充电最小电量
     }
     
-    # 充电桩配置
-    CHARGING_CONFIG = {
-        'fast_charging_power': 30,    # 快充功率 kW
-        'slow_charging_power': 7,     # 慢充功率 kW
-        'max_queue_length': 10,       # 最大队列长度
-        'waiting_area_capacity': 6,   # 等候区容量
-        'max_charging_duration': 480  # 最大充电时长（分钟）
-    }
+    # 充电桩配置（兼容C模块）
+    FAST_CHARGING_PILES = 2
+    SLOW_CHARGING_PILES = 3
+    WAITING_AREA_SIZE = 6
+    
+    # 系统参数配置
+    FAST_CHARGING_PILE_NUM = 2  # 快充桩数量
+    TRICKLE_CHARGING_PILE_NUM = 3  # 慢充桩数量
+    CHARGING_QUEUE_LEN = 2  # 充电桩排队队列长度
+    
+    # 充电功率配置
+    FAST_CHARGING_POWER = 30  # 快充功率：30度/小时
+    TRICKLE_CHARGING_POWER = 7  # 慢充功率：7度/小时
+    
+    # 计费配置（兼容C模块）
+    PEAK_PRICE = 1.0      # 峰时电价：1.0元/度
+    NORMAL_PRICE = 0.7    # 平时电价：0.7元/度
+    VALLEY_PRICE = 0.4    # 谷时电价：0.4元/度
+    SERVICE_PRICE = 0.8   # 服务费：0.8元/度
     
     # 分页配置
     PAGINATION_CONFIG = {
@@ -91,6 +102,10 @@ class DevelopmentConfig(Config):
     
     # 更宽松的Session配置
     SESSION_COOKIE_SECURE = False
+    
+    # 测试模式配置（用于加速充电测试）
+    TESTING_MODE = True
+    CHARGING_SPEED_FACTOR = 100  # 充电速度倍数（测试用）
 
 class TestingConfig(Config):
     """测试环境配置"""
@@ -106,6 +121,10 @@ class TestingConfig(Config):
     
     # 禁用CSRF保护（测试环境）
     WTF_CSRF_ENABLED = False
+    
+    # 测试模式配置
+    TESTING_MODE = True
+    CHARGING_SPEED_FACTOR = 1000  # 测试环境下更快的充电速度
 
 class ProductionConfig(Config):
     """生产环境配置"""
@@ -128,6 +147,10 @@ class ProductionConfig(Config):
     
     # 日志级别
     LOG_LEVEL = 'WARNING'
+    
+    # 生产模式配置
+    TESTING_MODE = False
+    CHARGING_SPEED_FACTOR = 1  # 正常充电速度
 
 # 根据环境变量选择配置
 config = {

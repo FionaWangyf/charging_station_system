@@ -132,7 +132,7 @@ class ChargingPile(db.Model):
             'pile_type': self.pile_type,
             'power_rating': float(self.power_rating),
             'status': self.status,
-            'location': self.location,
+            'location': self.location or '',  # 添加这一行
             'total_charges': self.total_charges,
             'total_power': float(self.total_power) if self.total_power else 0.0,
             'total_revenue': float(self.total_revenue) if self.total_revenue else 0.0,

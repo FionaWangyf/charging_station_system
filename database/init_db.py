@@ -1,5 +1,6 @@
 from models.user import db, User
 from models.billing import ChargingRecord, SystemConfig, ChargingPile
+from models.charging import ChargingSession  # 新增：导入充电会话模型
 from services.billing_service import BillingService
 from sqlalchemy import text
 
@@ -12,7 +13,7 @@ def init_database(app):
                 connection.execute(text('SELECT 1'))
             print("✅ 数据库连接成功！")
             
-            # 创建所有表
+            # 创建所有表（包括新的charging_sessions表）
             db.create_all()
             print("✅ 数据表创建成功！")
             
@@ -40,6 +41,8 @@ def init_database(app):
             
         except Exception as e:
             print(f"❌ 数据库初始化失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
             raise
 
 def init_billing_config():
@@ -69,11 +72,11 @@ def init_sample_piles():
     try:
         if ChargingPile.query.count() == 0:
             sample_piles = [
-                ChargingPile(id='A', name='快充桩A', pile_type='fast', power_rating=30.0),
-                ChargingPile(id='B', name='快充桩B', pile_type='fast', power_rating=30.0),
-                ChargingPile(id='C', name='慢充桩C', pile_type='slow', power_rating=7.0),
-                ChargingPile(id='D', name='慢充桩D', pile_type='slow', power_rating=7.0),
-                ChargingPile(id='E', name='慢充桩E', pile_type='slow', power_rating=7.0),
+                ChargingPile(id='A', name='快充桩A', pile_type='fast', power_rating=30.0, status='available'),
+                ChargingPile(id='B', name='快充桩B', pile_type='fast', power_rating=30.0, status='available'),
+                ChargingPile(id='C', name='慢充桩C', pile_type='slow', power_rating=7.0, status='available'),
+                ChargingPile(id='D', name='慢充桩D', pile_type='slow', power_rating=7.0, status='available'),
+                ChargingPile(id='E', name='慢充桩E', pile_type='slow', power_rating=7.0, status='available'),
             ]
             
             for pile in sample_piles:
