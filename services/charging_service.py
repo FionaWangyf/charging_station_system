@@ -6,24 +6,43 @@ from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional
 from threading import Lock
 from apscheduler.schedulers.background import BackgroundScheduler
+from decimal import Decimal
 
 from models.user import db
 from models.charging import ChargingSession, ChargingMode, ChargingStatus
 from models.billing import ChargingPile
-from config import get_config
 import scheduler_core
 from scheduler_core import PileType, PileStatus, Pile, ChargeRequest
 
 class ChargingService:
     """充电服务类 - 整合C模块的核心逻辑"""
     
-    def __init__(self, app=None, socketio=None):
+    def __init__(self):
+        """初始化服务（不依赖应用上下文）"""
+        self.app = None
+        self.socketio = None
+        self.lock = Lock()
+        self.config = None
+        self.redis_client = None
+        self.scheduler = None
+        self._initialized = False
+        
+        print("ChargeService 实例已创建（延迟初始化模式）")
+    
+    def init_app(self, app, socketio=None):
+        """延迟初始化应用（在应用上下文中调用）"""
+        if self._initialized:
+            print("ChargeService 已经初始化，跳过重复初始化")
+            return
+            
         self.app = app
         self.socketio = socketio
-        self.lock = Lock()
+        
+        # 现在可以安全地导入配置
+        from config import get_config
         self.config = get_config()
         
-        # Redis客户端
+        # 初始化Redis客户端
         self.redis_client = redis.Redis(
             host=self.config.REDIS_HOST,
             port=self.config.REDIS_PORT,
@@ -32,37 +51,52 @@ class ChargingService:
             decode_responses=True
         )
         
-        # 调度器
+        # 初始化调度器
         self.scheduler = BackgroundScheduler()
-        self.scheduler.start()
         
-        # 如果传入了app，立即初始化；否则等待延迟初始化
-        if app is not None:
-            self.init_app(app)
-    
-    def init_app(self, app):
-        """初始化应用"""
-        self.app = app
-        
+        # 在应用上下文中进行初始化
         with app.app_context():
-            # 初始化
-            self.init_redis_data()
-            self.init_piles_in_engine()
-            self.startup_state_sync()
-            
-            # 定时任务
-            self._setup_scheduled_jobs()
-            
-            # 启动调度引擎
-            scheduler_core.start_dispatch_loop()
-            
-            print("=" * 60)
-            print("充电服务已启动")
-            print("=" * 60)
+            try:
+                # 初始化Redis数据
+                self.init_redis_data()
+                
+                # 初始化充电桩
+                self.init_piles_in_engine()
+                
+                # 启动状态同步
+                self.startup_state_sync()
+                
+                # 设置定时任务
+                self._setup_scheduled_jobs()
+                
+                # 启动调度器
+                if not self.scheduler.running:
+                    self.scheduler.start()
+                    print("✅ APScheduler 调度器已启动")
+                
+                # 启动调度引擎
+                scheduler_core.start_dispatch_loop()
+                
+                self._initialized = True
+                
+                print("=" * 60)
+                print("🚀 充电服务初始化完成")
+                print("=" * 60)
+                
+            except Exception as e:
+                print(f"❌ 充电服务初始化失败: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
     
     def _setup_scheduled_jobs(self):
         """设置定时任务"""
+        if not self.app:
+            print("⚠️ 应用实例未设置，跳过定时任务设置")
+            return
+            
         def _with_app_context(func):
+            """确保定时任务在应用上下文中执行"""
             def wrapper(*args, **kwargs):
                 with self.app.app_context():
                     return func(*args, **kwargs)
@@ -77,21 +111,21 @@ class ChargingService:
             },
             {
                 "id": "charging_monitor",
-                "func": self.monitor_charging_progress,
-                "trigger": "interval",
+                "func": _with_app_context(self.monitor_charging_progress),
+                "trigger": "interval", 
                 "seconds": 10,
                 "misfire_grace_time": 5
             },
             {
                 "id": "station_to_engine_queue_processor",
-                "func": self.process_station_waiting_area_to_engine,
+                "func": _with_app_context(self.process_station_waiting_area_to_engine),
                 "trigger": "interval",
                 "seconds": 5,
                 "misfire_grace_time": 3
             },
             {
                 "id": "timeout_completing_checker",
-                "func": self.check_and_recover_timeout_completing_sessions,
+                "func": _with_app_context(self.check_and_recover_timeout_completing_sessions),
                 "trigger": "interval",
                 "seconds": 60,
                 "misfire_grace_time": 10
@@ -99,99 +133,129 @@ class ChargingService:
         ]
         
         for job in jobs:
-            if self.scheduler.get_job(job["id"]):
-                self.scheduler.remove_job(job["id"])
-            self.scheduler.add_job(**job)
+            try:
+                # 移除已存在的任务
+                if self.scheduler.get_job(job["id"]):
+                    self.scheduler.remove_job(job["id"])
+                
+                # 添加新任务
+                self.scheduler.add_job(**job)
+                print(f"✅ 定时任务已添加: {job['id']}")
+                
+            except Exception as e:
+                print(f"❌ 添加定时任务失败 {job['id']}: {e}")
     
     def init_redis_data(self):
         """初始化Redis数据"""
-        self.redis_client.delete('station_waiting_area:fast', 'station_waiting_area:trickle')
-        
-        # 从数据库获取充电桩数据并注册到引擎
-        piles = ChargingPile.query.all()
-        
-        for pile_db in piles:
-            if pile_db.status == 'offline':
-                print(f"充电桩 {pile_db.id} 处于离线状态，暂不添加到调度引擎。")
-                continue
+        if not self.redis_client:
+            print("❌ Redis客户端未初始化")
+            return
             
-            # 根据scheduler_core定义：D=直流(快充), A=交流(慢充)
-            engine_pile_type = PileType.D if pile_db.pile_type == 'fast' else PileType.A
-            engine_status = PileStatus.IDLE
+        try:
+            # 清理旧数据
+            self.redis_client.delete('station_waiting_area:fast', 'station_waiting_area:trickle')
+            print("🧹 Redis数据已清理")
             
-            if pile_db.status == 'fault':
-                engine_status = PileStatus.FAULT
+            # 从数据库获取充电桩数据并注册到引擎
+            piles = ChargingPile.query.all()
+            print(f"📊 从数据库获取到 {len(piles)} 个充电桩")
             
-            pile_for_engine = Pile(
-                pile_id=pile_db.id,
-                type=engine_pile_type,
-                max_kw=float(pile_db.power_rating),
-                status=engine_status
-            )
-            scheduler_core.add_pile(pile_for_engine)
-        
-        print("充电桩已注册到调度引擎。")
+            for pile_db in piles:
+                if pile_db.status == 'offline':
+                    print(f"⚠️ 充电桩 {pile_db.id} 处于离线状态，暂不添加到调度引擎")
+                    continue
+                
+                # 根据scheduler_core定义：D=直流(快充), A=交流(慢充)
+                engine_pile_type = PileType.D if pile_db.pile_type == 'fast' else PileType.A
+                engine_status = PileStatus.IDLE
+                
+                if pile_db.status == 'fault':
+                    engine_status = PileStatus.FAULT
+                
+                pile_for_engine = Pile(
+                    pile_id=pile_db.id,
+                    type=engine_pile_type,
+                    max_kw=float(pile_db.power_rating),
+                    status=engine_status
+                )
+                
+                try:
+                    scheduler_core.add_pile(pile_for_engine)
+                    print(f"✅ 充电桩已注册: {pile_db.id} ({pile_db.pile_type})")
+                except Exception as e:
+                    print(f"❌ 注册充电桩失败 {pile_db.id}: {e}")
+            
+            print("✅ 充电桩注册到调度引擎完成")
+            
+        except Exception as e:
+            print(f"❌ 初始化Redis数据失败: {e}")
+            raise
     
     def init_piles_in_engine(self):
-        """初始化引擎中的充电桩"""
+        """初始化引擎中的充电桩（预留扩展）"""
         pass
     
     def startup_state_sync(self):
         """启动时的状态同步"""
         try:
-            print("执行启动状态同步...")
+            print("🔄 执行启动状态同步...")
             
             # 处理所有completing状态的会话
             completing_sessions = ChargingSession.query.filter_by(
                 status=ChargingStatus.COMPLETING
             ).all()
             
-            for session in completing_sessions:
-                print(f"启动时发现completing会话: {session.session_id}，强制完成")
+            if completing_sessions:
+                print(f"🔧 发现 {len(completing_sessions)} 个completing会话，开始处理...")
                 
-                fees = self.calculate_charging_fees(
-                    session.session_id,
-                    float(session.actual_amount or 0),
-                    session.start_time,
-                    datetime.now()
-                )
+                for session in completing_sessions:
+                    print(f"⚡ 处理completing会话: {session.session_id}")
+                    
+                    fees = self.calculate_charging_fees(
+                        session.session_id,
+                        float(session.actual_amount or 0),
+                        session.start_time,
+                        datetime.now()
+                    )
+                    
+                    session.status = ChargingStatus.COMPLETED
+                    session.end_time = datetime.now()
+                    session.charging_fee = fees['charging_fee']
+                    session.service_fee = fees['service_fee']
+                    session.total_fee = fees['total_fee']
+                    
+                    # 清理Redis
+                    self.redis_client.delete(f"session_status:{session.session_id}")
+                    self.redis_client.delete(f"session_completing:{session.session_id}")
+                    
+                    if session.pile_id:
+                        try:
+                            scheduler_core.end_charging(session.pile_id)
+                        except:
+                            pass
+                        self.update_pile_redis_status(session.pile_id, PileStatus.IDLE.value, None)
                 
-                session.status = ChargingStatus.COMPLETED
-                session.end_time = datetime.now()
-                session.charging_fee = fees['charging_fee']
-                session.service_fee = fees['service_fee']
-                session.total_fee = fees['total_fee']
-                
-                # 清理Redis
-                self.redis_client.delete(f"session_status:{session.session_id}")
-                self.redis_client.delete(f"session_completing:{session.session_id}")
-                
-                if session.pile_id:
-                    try:
-                        scheduler_core.end_charging(session.pile_id)
-                    except:
-                        pass
-                    self.update_pile_redis_status(session.pile_id, PileStatus.IDLE.value, None)
-            
-            db.session.commit()
+                db.session.commit()
+                print(f"✅ 完成了 {len(completing_sessions)} 个completing会话的处理")
             
             # 强制同步所有充电桩状态
             import time
             time.sleep(1)
             self.force_sync_engine_pile_states()
             
-            if completing_sessions:
-                print(f"启动时完成了 {len(completing_sessions)} 个completing会话")
-            print("启动状态同步完成")
+            print("✅ 启动状态同步完成")
             
         except Exception as e:
             db.session.rollback()
-            print(f"启动状态同步出错: {e}")
+            print(f"❌ 启动状态同步失败: {e}")
             import traceback
             traceback.print_exc()
     
     def submit_charging_request(self, user_id: int, charging_mode: str, requested_amount: float) -> Dict:
         """提交充电请求"""
+        if not self._initialized:
+            return {'success': False, 'message': '充电服务未初始化', 'code': 5003}
+            
         try:
             with self.lock:
                 # 检查等候区容量
@@ -251,8 +315,10 @@ class ChargingService:
                 def delayed_process():
                     import time
                     time.sleep(0.1)
-                    self.process_station_waiting_area_to_engine()
-                    self.broadcast_status_update()
+                    if self.app:
+                        with self.app.app_context():
+                            self.process_station_waiting_area_to_engine()
+                            self.broadcast_status_update()
                 
                 threading.Thread(target=delayed_process, daemon=True).start()
                 
@@ -267,7 +333,7 @@ class ChargingService:
                 
         except Exception as e:
             db.session.rollback()
-            print(f"提交充电请求错误: {e}")
+            print(f"❌ 提交充电请求错误: {e}")
             import traceback
             traceback.print_exc()
             return {'success': False, 'message': '系统错误，请稍后重试', 'code': 5001}
@@ -280,6 +346,9 @@ class ChargingService:
     
     def process_station_waiting_area_to_engine(self):
         """将请求从充电站等候区移动到引擎队列"""
+        if not self._initialized:
+            return
+            
         with self.lock:
             for mode in ['fast', 'trickle']:
                 station_queue_key = f"station_waiting_area:{mode}"
@@ -292,12 +361,12 @@ class ChargingService:
                     # 验证数据库状态
                     session = ChargingSession.query.filter_by(session_id=session_id).first()
                     if not session or session.status != ChargingStatus.STATION_WAITING:
-                        print(f"会话 {session_id} 状态不符合预期，跳过处理")
+                        print(f"⚠️ 会话 {session_id} 状态不符合预期，跳过处理")
                         continue
                     
                     # 生成队列号并添加到引擎
                     engine_pile_type = self._map_charging_mode_to_engine_piletype(request_data['charging_mode'])
-                    engine_queue_no = scheduler_core.generate_queue_number(engine_pile_type.value)  # 使用.value获取字符串
+                    engine_queue_no = scheduler_core.generate_queue_number(engine_pile_type.value)
                     
                     engine_req = ChargeRequest(
                         req_id=session_id,
@@ -321,7 +390,7 @@ class ChargingService:
                         "queue_number": engine_queue_no
                     })
                     
-                    print(f"将会话 {session_id} 移动到引擎的 {mode} 队列，队列号为 {engine_queue_no}")
+                    print(f"🔄 会话 {session_id} 移动到引擎的 {mode} 队列，队列号: {engine_queue_no}")
                     
                     # WebSocket通知
                     if self.socketio:
@@ -336,11 +405,13 @@ class ChargingService:
     
     def _map_charging_mode_to_engine_piletype(self, charging_mode: str) -> PileType:
         """映射充电模式到引擎桩类型"""
-        # 根据scheduler_core的定义：D=直流(快充), A=交流(慢充)
         return PileType.D if charging_mode == 'fast' else PileType.A
     
     def poll_and_process_engine_events(self):
         """轮询和处理引擎事件"""
+        if not self._initialized:
+            return
+            
         try:
             events = scheduler_core.pop_events()
             
@@ -356,7 +427,7 @@ class ChargingService:
                     
                     session = ChargingSession.query.filter_by(session_id=session_id).first()
                     if session and session.status == ChargingStatus.CANCELLING_AFTER_DISPATCH:
-                        print(f"会话 {session_id} 被标记为取消，调度后立即结束")
+                        print(f"⚠️ 会话 {session_id} 被标记为取消，调度后立即结束")
                         scheduler_core.end_charging(pile_id)
                     else:
                         self.handle_engine_dispatch(session_id, pile_id, start_time_dt)
@@ -393,14 +464,14 @@ class ChargingService:
             self.check_and_recover_timeout_completing_sessions()
             
         except Exception as e:
-            print(f"轮询引擎事件错误: {e}")
+            print(f"❌ 轮询引擎事件错误: {e}")
             import traceback
             traceback.print_exc()
     
     def handle_engine_dispatch(self, session_id: str, pile_id: str, engine_start_time: datetime):
         """处理引擎调度事件"""
         with self.lock:
-            print(f"处理调度: 会话 {session_id} 到充电桩 {pile_id}")
+            print(f"⚡ 处理调度: 会话 {session_id} 到充电桩 {pile_id}")
             
             session = ChargingSession.query.filter_by(session_id=session_id).first()
             if session:
@@ -435,6 +506,9 @@ class ChargingService:
     
     def monitor_charging_progress(self):
         """监控充电进度"""
+        if not self._initialized:
+            return
+            
         try:
             with self.lock:
                 active_sessions = db.session.query(ChargingSession)\
@@ -477,15 +551,15 @@ class ChargingService:
                         is_first_completion = self.redis_client.set(completion_key, "processing", nx=True, ex=30)
                         
                         if is_first_completion:
-                            print(f"会话 {session.session_id} 达到请求电量，通过引擎结束充电")
+                            print(f"✅ 会话 {session.session_id} 达到请求电量，通过引擎结束充电")
                             
                             session.status = ChargingStatus.COMPLETING
                             
                             try:
                                 scheduler_core.end_charging(session.pile_id)
-                                print(f"已向引擎发送end_charging指令: {session.pile_id}")
+                                print(f"📤 已向引擎发送end_charging指令: {session.pile_id}")
                             except Exception as engine_error:
-                                print(f"向引擎发送end_charging指令失败: {engine_error}")
+                                print(f"❌ 向引擎发送end_charging指令失败: {engine_error}")
                                 self.redis_client.set(f"force_complete:{session.session_id}", "true", ex=60)
                 
                 if sessions_to_update:
@@ -494,14 +568,14 @@ class ChargingService:
                     
         except Exception as e:
             db.session.rollback()
-            print(f"监控充电进度错误: {e}")
+            print(f"❌ 监控充电进度错误: {e}")
             import traceback
             traceback.print_exc()
     
     def handle_engine_charging_end(self, session_id: str, pile_id: str, graceful_end: bool = True):
         """处理引擎充电结束事件"""
         with self.lock:
-            print(f"处理充电结束: 会话 {session_id} 在充电桩 {pile_id}")
+            print(f"🔚 处理充电结束: 会话 {session_id} 在充电桩 {pile_id}")
             
             # 清理Redis完成标志
             completion_key = f"session_completing:{session_id}"
@@ -509,7 +583,7 @@ class ChargingService:
             
             session = ChargingSession.query.filter_by(session_id=session_id).first()
             if not session:
-                print(f"未找到会话 {session_id}")
+                print(f"⚠️ 未找到会话 {session_id}")
                 self.update_pile_redis_status(pile_id, PileStatus.IDLE.value, None)
                 return
             
@@ -543,8 +617,31 @@ class ChargingService:
             # 更新充电桩统计
             if session.pile:
                 session.pile.total_charges += 1
-                session.pile.total_power += actual_amount
-                session.pile.total_revenue += fees['total_fee']
+                session.pile.total_power += Decimal(str(actual_amount))
+                session.pile.total_revenue += Decimal(str(fees['total_fee']))
+            
+            # 🔧 新增：创建计费记录
+            if final_status == ChargingStatus.COMPLETED and actual_amount > 0:
+                try:
+                    from services.billing_service import BillingService
+                    
+                    billing_record = BillingService.create_charging_record(
+                        user_id=session.user_id,
+                        pile_id=pile_id,
+                        start_time=session.start_time,
+                        end_time=session.end_time or datetime.now(),
+                        power_consumed=actual_amount
+                    )
+                    
+                    if billing_record:
+                        print(f"✅ 创建计费记录: ID={billing_record.id}, 费用={billing_record.total_fee}元")
+                    else:
+                        print(f"⚠️ 计费记录创建失败")
+                        
+                except Exception as billing_error:
+                    print(f"❌ 创建计费记录时出错: {billing_error}")
+                    import traceback
+                    traceback.print_exc()
             
             db.session.commit()
             
@@ -577,16 +674,16 @@ class ChargingService:
                 .order_by(ChargingSession.start_time.desc()).first()
             
             if session:
-                print(f"找到充电桩 {pile_id} 上的会话 {session.session_id}")
+                print(f"🔍 找到充电桩 {pile_id} 上的会话 {session.session_id}")
                 self.handle_engine_charging_end(session.session_id, pile_id, graceful_end=True)
             else:
-                print(f"充电桩 {pile_id} 上未找到活跃会话，仅更新充电桩状态")
+                print(f"⚠️ 充电桩 {pile_id} 上未找到活跃会话，仅更新充电桩状态")
                 self.update_pile_redis_status(pile_id, PileStatus.IDLE.value, None)
     
     def handle_engine_pile_fault(self, pile_id: str):
         """处理充电桩故障事件"""
         with self.lock:
-            print(f"处理充电桩故障: 充电桩 {pile_id}")
+            print(f"🚫 处理充电桩故障: 充电桩 {pile_id}")
             
             # 更新充电桩状态
             pile = ChargingPile.query.get(pile_id)
@@ -634,7 +731,7 @@ class ChargingService:
     def handle_engine_pile_recover(self, pile_id: str):
         """处理充电桩恢复事件"""
         with self.lock:
-            print(f"处理充电桩恢复: 充电桩 {pile_id}")
+            print(f"🔧 处理充电桩恢复: 充电桩 {pile_id}")
             
             pile = ChargingPile.query.get(pile_id)
             if pile:
@@ -646,6 +743,9 @@ class ChargingService:
     
     def check_and_recover_timeout_completing_sessions(self):
         """检查和恢复超时的completing状态会话"""
+        if not self._initialized:
+            return
+            
         lock_key = "timeout_check_lock"
         
         if not self.redis_client.set(lock_key, "processing", nx=True, ex=15):
@@ -662,7 +762,7 @@ class ChargingService:
             if not timeout_sessions:
                 return
             
-            print(f"发现 {len(timeout_sessions)} 个超时的completing会话，开始恢复...")
+            print(f"🕐 发现 {len(timeout_sessions)} 个超时的completing会话，开始恢复...")
             
             recovered_count = 0
             for session in timeout_sessions:
@@ -670,7 +770,7 @@ class ChargingService:
                 if session.status != ChargingStatus.COMPLETING:
                     continue
                 
-                print(f"恢复超时会话: {session.session_id}")
+                print(f"🔄 恢复超时会话: {session.session_id}")
                 
                 actual_amount = float(session.actual_amount or 0)
                 fees = self.calculate_charging_fees(
@@ -688,11 +788,32 @@ class ChargingService:
                 
                 recovered_count += 1
                 
+                # 🔧 新增：为恢复的会话创建计费记录
+                if actual_amount > 0:
+                    try:
+                        from services.billing_service import BillingService
+                        
+                        billing_record = BillingService.create_charging_record(
+                            user_id=session.user_id,
+                            pile_id=session.pile_id or 'UNKNOWN',
+                            start_time=session.start_time,
+                            end_time=session.end_time,
+                            power_consumed=actual_amount
+                        )
+                        
+                        if billing_record:
+                            print(f"✅ 为恢复会话创建计费记录: ID={billing_record.id}")
+                        else:
+                            print(f"⚠️ 恢复会话计费记录创建失败")
+                            
+                    except Exception as billing_error:
+                        print(f"❌ 创建恢复会话计费记录时出错: {billing_error}")
+                
                 # 更新充电桩统计
                 if session.pile:
                     session.pile.total_charges += 1
-                    session.pile.total_power += actual_amount
-                    session.pile.total_revenue += fees['total_fee']
+                    session.pile.total_power += Decimal(str(actual_amount))
+                    session.pile.total_revenue += Decimal(str(fees['total_fee']))
                     
                     try:
                         scheduler_core.end_charging(session.pile_id)
@@ -717,13 +838,13 @@ class ChargingService:
             
             if recovered_count > 0:
                 db.session.commit()
-                print(f"成功恢复了 {recovered_count} 个超时会话")
+                print(f"✅ 成功恢复了 {recovered_count} 个超时会话")
                 self.broadcast_status_update()
                 self.process_station_waiting_area_to_engine()
             
         except Exception as e:
             db.session.rollback()
-            print(f"检查超时completing会话错误: {e}")
+            print(f"❌ 检查超时completing会话错误: {e}")
             import traceback
             traceback.print_exc()
         finally:
@@ -732,12 +853,12 @@ class ChargingService:
     def force_sync_engine_pile_states(self):
         """强制同步引擎与应用的充电桩状态"""
         try:
-            print("开始强制同步引擎充电桩状态...")
+            print("🔄 开始强制同步引擎充电桩状态...")
             
             try:
                 all_engine_piles = scheduler_core.get_all_piles()
             except AttributeError:
-                print("警告: scheduler_core.get_all_piles()不可用，跳过强制同步")
+                print("⚠️ scheduler_core.get_all_piles()不可用，跳过强制同步")
                 return
             
             for pile in all_engine_piles:
@@ -752,32 +873,44 @@ class ChargingService:
                     ).first()
                     
                     if not active_session:
-                        print(f"检测到状态不一致: 充电桩 {pile_id} 引擎状态为BUSY但无活跃会话，强制释放")
+                        print(f"🔧 检测到状态不一致: 充电桩 {pile_id} 引擎状态为BUSY但无活跃会话，强制释放")
                         scheduler_core.end_charging(pile_id)
                         self.update_pile_redis_status(pile_id, PileStatus.IDLE.value, None)
                     else:
-                        print(f"充电桩 {pile_id} 状态正常: 引擎BUSY且有活跃会话 {current_req_id}")
+                        print(f"✅ 充电桩 {pile_id} 状态正常: 引擎BUSY且有活跃会话 {current_req_id}")
                 
                 elif engine_status == PileStatus.IDLE:
                     self.update_pile_redis_status(pile_id, PileStatus.IDLE.value, None)
-                    print(f"同步充电桩 {pile_id} 状态为IDLE")
+                    print(f"🔄 同步充电桩 {pile_id} 状态为IDLE")
             
-            print("强制同步完成")
+            print("✅ 强制同步完成")
             
         except Exception as e:
-            print(f"强制同步引擎状态时出错: {e}")
+            print(f"❌ 强制同步引擎状态时出错: {e}")
             import traceback
             traceback.print_exc()
     
-    def calculate_charging_fees(self, session_id: str, actual_amount: float, 
+    def calculate_charging_fees(self, session_id: str, actual_amount, 
                                start_time: Optional[datetime], end_time: Optional[datetime]) -> Dict[str, float]:
         """计算充电费用"""
-        if actual_amount <= 0 or not start_time or not end_time or start_time >= end_time:
+        # 统一处理 actual_amount 类型
+        try:
+            if isinstance(actual_amount, (int, float)):
+                amount_value = float(actual_amount)
+            elif hasattr(actual_amount, '__float__'):
+                amount_value = float(actual_amount)
+            else:
+                amount_value = float(str(actual_amount))
+        except (ValueError, TypeError):
+            print(f"⚠️ actual_amount 转换失败: {actual_amount} ({type(actual_amount)})")
+            amount_value = 0.0
+        
+        if amount_value <= 0 or not start_time or not end_time or start_time >= end_time:
             return {'charging_fee': 0.0, 'service_fee': 0.0, 'total_fee': 0.0}
         
-        # 使用现有的计费服务
+        # 使用现有的计费服务，传入处理后的数值
         from services.billing_service import BillingService
-        billing_result = BillingService.calculate_billing(start_time, end_time, actual_amount)
+        billing_result = BillingService.calculate_billing(start_time, end_time, amount_value)
         
         return {
             'charging_fee': billing_result['electricity_fee'],
@@ -818,10 +951,13 @@ class ChargingService:
                 self.socketio.emit('status_update', status_data, namespace='/')
             
         except Exception as e:
-            print(f"广播状态更新错误: {e}")
+            print(f"❌ 广播状态更新错误: {e}")
     
     def get_system_status_for_ui(self) -> Dict:
         """获取系统状态用于UI显示"""
+        if not self._initialized or not self.redis_client:
+            return {'error': '服务未初始化'}
+            
         station_waiting = {
             'fast': self.redis_client.llen('station_waiting_area:fast'),
             'trickle': self.redis_client.llen('station_waiting_area:trickle'),
@@ -829,8 +965,8 @@ class ChargingService:
         station_waiting['total'] = station_waiting['fast'] + station_waiting['trickle']
         
         try:
-            engine_q_fast_reqs = scheduler_core.get_waiting_list(PileType.D.value)  # 使用.value
-            engine_q_trickle_reqs = scheduler_core.get_waiting_list(PileType.A.value)  # 使用.value
+            engine_q_fast_reqs = scheduler_core.get_waiting_list(PileType.D.value)
+            engine_q_trickle_reqs = scheduler_core.get_waiting_list(PileType.A.value)
         except:
             engine_q_fast_reqs = []
             engine_q_trickle_reqs = []
@@ -852,7 +988,7 @@ class ChargingService:
             app_pile_info_redis = self.redis_client.hgetall(f"pile_status:{eng_pile_obj.pile_id}")
             piles_ui_info[eng_pile_obj.pile_id] = {
                 'id': eng_pile_obj.pile_id,
-                'type': 'fast' if eng_pile_obj.type == PileType.D else 'trickle',  # 根据调度引擎类型映射
+                'type': 'fast' if eng_pile_obj.type == PileType.D else 'trickle',
                 'engine_status': eng_pile_obj.status.value,
                 'app_status': app_pile_info_redis.get('status', 'unknown'),
                 'current_app_session_id': app_pile_info_redis.get('current_charging_session_id', ''),
@@ -870,6 +1006,9 @@ class ChargingService:
     
     def get_queue_info_for_user(self, user_id: int, charging_mode_filter: Optional[str] = None) -> Dict:
         """获取用户队列信息"""
+        if not self._initialized:
+            return {'message': '充电服务未初始化', 'has_active_request': False}
+            
         active_session = self.get_user_active_session_details(user_id)
         
         if not active_session:
@@ -921,7 +1060,7 @@ class ChargingService:
         elif status == 'engine_queued':
             engine_pile_type_filter = self._map_charging_mode_to_engine_piletype(current_mode)
             try:
-                engine_q_list = scheduler_core.get_waiting_list(engine_pile_type_filter.value, n=-1)  # 使用.value
+                engine_q_list = scheduler_core.get_waiting_list(engine_pile_type_filter.value, n=-1)
                 response_data['total_in_engine_queue'] = len(engine_q_list)
                 
                 pos_engine = 0
@@ -939,3 +1078,192 @@ class ChargingService:
             response_data['estimated_wait_time_msg'] = f"正在充电桩 {active_session.pile_id} 充电中。"
         
         return response_data
+    
+    def cancel_charging_request(self, session_id: str, user_id: int) -> Dict:
+        """取消充电请求"""
+        if not self._initialized:
+            return {'success': False, 'message': '充电服务未初始化', 'code': 5003}
+            
+        try:
+            with self.lock:
+                # 验证会话归属
+                session = ChargingSession.query.filter_by(
+                    session_id=session_id,
+                    user_id=user_id
+                ).first()
+                
+                if not session:
+                    return {'success': False, 'message': '充电会话不存在或无权访问', 'code': 4004}
+                
+                current_status = session.status
+                
+                if current_status in [ChargingStatus.COMPLETED, ChargingStatus.CANCELLED, ChargingStatus.FAULT_COMPLETED]:
+                    return {'success': False, 'message': '该充电会话已结束，无法取消', 'code': 4005}
+                
+                if current_status == ChargingStatus.STATION_WAITING:
+                    # 从充电站等候区移除
+                    station_queue_key = f"station_waiting_area:{session.charging_mode.value}"
+                    queue_items = self.redis_client.lrange(station_queue_key, 0, -1)
+                    
+                    for idx, item_json in enumerate(queue_items):
+                        item = json.loads(item_json)
+                        if item['session_id'] == session_id:
+                            self.redis_client.lrem(station_queue_key, 1, item_json)
+                            break
+                    
+                    session.status = ChargingStatus.CANCELLED
+                    session.end_time = datetime.now()
+                    
+                elif current_status == ChargingStatus.ENGINE_QUEUED:
+                    # 标记取消，让引擎处理
+                    session.status = ChargingStatus.CANCELLED
+                    session.end_time = datetime.now()
+                    
+                elif current_status in [ChargingStatus.CHARGING, ChargingStatus.COMPLETING]:
+                    if session.pile_id:
+                        # 立即结束充电
+                        try:
+                            scheduler_core.end_charging(session.pile_id)
+                            session.status = ChargingStatus.CANCELLING_AFTER_DISPATCH
+                        except Exception as e:
+                            print(f"❌ 结束充电时出错: {e}")
+                            return {'success': False, 'message': '取消充电失败', 'code': 5002}
+                    else:
+                        session.status = ChargingStatus.CANCELLED
+                        session.end_time = datetime.now()
+                
+                # 清理Redis状态
+                self.redis_client.delete(f"session_status:{session_id}")
+                
+                db.session.commit()
+                
+                # WebSocket通知
+                if self.socketio:
+                    self.socketio.emit('user_specific_event', {
+                        'message': f'充电请求 {session_id} 已取消',
+                        'type': 'request_cancelled',
+                        'session_id': session_id,
+                        'status': session.status.value
+                    }, room=f'user_{user_id}')
+                
+                self.broadcast_status_update()
+                
+                return {
+                    'success': True,
+                    'message': '充电请求已成功取消',
+                    'data': {
+                        'session_id': session_id,
+                        'status': session.status.value,
+                        'cancelled_at': session.end_time.isoformat() if session.end_time else None
+                    }
+                }
+                
+        except Exception as e:
+            db.session.rollback()
+            print(f"❌ 取消充电请求错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'success': False, 'message': '系统错误，请稍后重试', 'code': 5001}
+    
+    def modify_charging_request(self, session_id: str, user_id: int, 
+                              new_charging_mode: Optional[str] = None,
+                              new_requested_amount: Optional[float] = None) -> Dict:
+        """修改充电请求"""
+        if not self._initialized:
+            return {'success': False, 'message': '充电服务未初始化', 'code': 5003}
+            
+        try:
+            with self.lock:
+                # 验证会话归属
+                session = ChargingSession.query.filter_by(
+                    session_id=session_id,
+                    user_id=user_id
+                ).first()
+                
+                if not session:
+                    return {'success': False, 'message': '充电会话不存在或无权访问', 'code': 4004}
+                
+                current_status = session.status
+                
+                # 检查是否允许修改
+                if current_status not in [ChargingStatus.STATION_WAITING, ChargingStatus.ENGINE_QUEUED]:
+                    return {'success': False, 'message': '当前状态不允许修改请求', 'code': 4006}
+                
+                modified_fields = []
+                
+                # 修改充电模式
+                if new_charging_mode and new_charging_mode != session.charging_mode.value:
+                    if current_status == ChargingStatus.ENGINE_QUEUED:
+                        return {'success': False, 'message': '调度队列中的请求不允许修改充电模式', 'code': 4007}
+                    
+                    # 从当前队列移除
+                    old_queue_key = f"station_waiting_area:{session.charging_mode.value}"
+                    queue_items = self.redis_client.lrange(old_queue_key, 0, -1)
+                    
+                    for idx, item_json in enumerate(queue_items):
+                        item = json.loads(item_json)
+                        if item['session_id'] == session_id:
+                            self.redis_client.lrem(old_queue_key, 1, item_json)
+                            
+                            # 更新数据并添加到新队列
+                            item['charging_mode'] = new_charging_mode
+                            self.redis_client.rpush(f"station_waiting_area:{new_charging_mode}", json.dumps(item))
+                            break
+                    
+                    session.charging_mode = ChargingMode(new_charging_mode)
+                    modified_fields.append('charging_mode')
+                
+                # 修改请求充电量
+                if new_requested_amount and new_requested_amount != float(session.requested_amount):
+                    session.requested_amount = new_requested_amount
+                    modified_fields.append('requested_amount')
+                    
+                    # 更新Redis中的数据
+                    if current_status == ChargingStatus.STATION_WAITING:
+                        queue_key = f"station_waiting_area:{session.charging_mode.value}"
+                        queue_items = self.redis_client.lrange(queue_key, 0, -1)
+                        
+                        for idx, item_json in enumerate(queue_items):
+                            item = json.loads(item_json)
+                            if item['session_id'] == session_id:
+                                item['requested_amount'] = new_requested_amount
+                                self.redis_client.lset(queue_key, idx, json.dumps(item))
+                                break
+                
+                if not modified_fields:
+                    return {'success': False, 'message': '没有需要修改的字段', 'code': 4008}
+                
+                # 更新Redis状态
+                if new_requested_amount:
+                    self.redis_client.hset(f"session_status:{session_id}", 
+                                         "requested_amount", str(new_requested_amount))
+                
+                db.session.commit()
+                
+                # WebSocket通知
+                if self.socketio:
+                    self.socketio.emit('user_specific_event', {
+                        'message': f'充电请求 {session_id} 已修改: {", ".join(modified_fields)}',
+                        'type': 'request_modified',
+                        'session_id': session_id,
+                        'modified_fields': modified_fields
+                    }, room=f'user_{user_id}')
+                
+                self.broadcast_status_update()
+                
+                return {
+                    'success': True,
+                    'message': f'充电请求已成功修改: {", ".join(modified_fields)}',
+                    'data': {
+                        'session_id': session_id,
+                        'modified_fields': modified_fields,
+                        'current_status': session.status.value
+                    }
+                }
+                
+        except Exception as e:
+            db.session.rollback()
+            print(f"❌ 修改充电请求错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'success': False, 'message': '系统错误，请稍后重试', 'code': 5001}

@@ -96,12 +96,26 @@ class BillingService:
     
     @staticmethod
     def calculate_billing(start_time: datetime, end_time: datetime, 
-                         power_consumed: Decimal) -> Dict:
+                         power_consumed) -> Dict:
         """
         计算充电费用
-        简化版本：按开始时间的时段统一计费
-        完整版本应该按时段分段计费
+        支持传入 float、Decimal 或数字字符串类型的 power_consumed
         """
+        # 统一转换为 Decimal 类型，确保精度
+        try:
+            if isinstance(power_consumed, (int, float)):
+                power_consumed_decimal = Decimal(str(power_consumed))
+            elif isinstance(power_consumed, str):
+                power_consumed_decimal = Decimal(power_consumed)
+            elif isinstance(power_consumed, Decimal):
+                power_consumed_decimal = power_consumed
+            else:
+                # 尝试转换未知类型
+                power_consumed_decimal = Decimal(str(float(power_consumed)))
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ power_consumed 类型转换失败: {power_consumed} ({type(power_consumed)}), 错误: {e}")
+            power_consumed_decimal = Decimal('0')
+        
         # 获取当前费率配置
         rates = BillingService.get_billing_rates()
         
@@ -111,18 +125,18 @@ class BillingService:
         # 判断时段
         time_period = BillingService.get_time_period(start_time)
         
-        # 获取对应时段的电价
+        # 获取对应时段的电价，统一转换为 Decimal
         rate_key = f'{time_period}_rate'
         electricity_rate = Decimal(str(rates[rate_key]))
         service_fee_rate = Decimal(str(rates['service_fee_rate']))
         
-        # 计算费用
-        electricity_fee = power_consumed * electricity_rate
-        service_fee = power_consumed * service_fee_rate
+        # 计算费用 - 现在都是 Decimal 类型，可以安全相乘
+        electricity_fee = power_consumed_decimal * electricity_rate
+        service_fee = power_consumed_decimal * service_fee_rate
         total_fee = electricity_fee + service_fee
         
         return {
-            'power_consumed': float(power_consumed),
+            'power_consumed': float(power_consumed_decimal),
             'duration_hours': round(duration_hours, 2),
             'time_period': time_period,
             'electricity_rate': float(electricity_rate),
@@ -136,11 +150,21 @@ class BillingService:
     
     @staticmethod
     def create_charging_record(user_id: int, pile_id: str, start_time: datetime,
-                             end_time: datetime, power_consumed: Decimal) -> Optional[ChargingRecord]:
+                             end_time: datetime, power_consumed) -> Optional[ChargingRecord]:
         """创建充电记录"""
         try:
             # 计算费用
             billing_result = BillingService.calculate_billing(start_time, end_time, power_consumed)
+            
+            # 确保 power_consumed 是 Decimal 类型
+            if isinstance(power_consumed, (int, float)):
+                power_consumed_decimal = Decimal(str(power_consumed))
+            elif isinstance(power_consumed, str):
+                power_consumed_decimal = Decimal(power_consumed)
+            elif isinstance(power_consumed, Decimal):
+                power_consumed_decimal = power_consumed
+            else:
+                power_consumed_decimal = Decimal(str(float(power_consumed)))
             
             # 创建记录
             record = ChargingRecord(
@@ -148,7 +172,7 @@ class BillingService:
                 pile_id=pile_id,
                 start_time=start_time,
                 end_time=end_time,
-                power_consumed=power_consumed,
+                power_consumed=power_consumed_decimal,
                 electricity_fee=Decimal(str(billing_result['electricity_fee'])),
                 service_fee=Decimal(str(billing_result['service_fee'])),
                 total_fee=Decimal(str(billing_result['total_fee'])),
@@ -159,7 +183,10 @@ class BillingService:
             db.session.add(record)
             db.session.commit()
             return record
-        except Exception:
+        except Exception as e:
+            print(f"❌ 创建充电记录失败: {e}")
+            import traceback
+            traceback.print_exc()
             db.session.rollback()
             return None
     
@@ -215,7 +242,8 @@ class BillingService:
                     'total_cost': round(total_cost, 2)
                 }
             }
-        except Exception:
+        except Exception as e:
+            print(f"❌ 获取用户充电记录失败: {e}")
             return {
                 'records': [],
                 'pagination': {
@@ -247,5 +275,6 @@ class BillingService:
             if record:
                 return record.to_detail_dict()
             return None
-        except Exception:
+        except Exception as e:
+            print(f"❌ 获取充电记录详情失败: {e}")
             return None

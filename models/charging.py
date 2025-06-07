@@ -59,8 +59,9 @@ class ChargingSession(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, comment='创建时间')
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, comment='更新时间')
     
-    # 建立关系
+    # 建立关系（使用字符串引用避免循环导入）
     user = db.relationship('User', backref=db.backref('charging_sessions', lazy=True))
+    # 注意：这里使用字符串引用，避免循环导入问题
     pile = db.relationship('ChargingPile', backref=db.backref('charging_sessions', lazy=True))
     
     def to_dict(self):
@@ -103,6 +104,3 @@ class ChargingSession(db.Model):
     
     def __repr__(self):
         return f'<ChargingSession {self.session_id}>'
-
-# 更新现有的ChargingPile模型（在billing.py中）以支持新的状态
-# 注意：你可能需要将这个模型移动到这里，或者在billing.py中导入新的枚举

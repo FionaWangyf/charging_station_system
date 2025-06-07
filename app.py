@@ -9,13 +9,15 @@ load_dotenv()
 
 from config import get_config
 from models.user import db
+
 def init_database(app):
     """初始化数据库"""
     with app.app_context():
         try:
             # 检查数据库连接
             with db.engine.connect() as connection:
-                connection.execute(db.text('SELECT 1'))
+                from sqlalchemy import text
+                connection.execute(text('SELECT 1'))
             print("✅ 数据库连接成功！")
             
             # 创建所有表
@@ -78,11 +80,11 @@ def init_sample_piles():
         from models.billing import ChargingPile
         if ChargingPile.query.count() == 0:
             sample_piles = [
-                ChargingPile(id='A', name='快充桩A', pile_type='fast', power_rating=30.0),
-                ChargingPile(id='B', name='快充桩B', pile_type='fast', power_rating=30.0),
-                ChargingPile(id='C', name='慢充桩C', pile_type='slow', power_rating=7.0),
-                ChargingPile(id='D', name='慢充桩D', pile_type='slow', power_rating=7.0),
-                ChargingPile(id='E', name='慢充桩E', pile_type='slow', power_rating=7.0),
+                ChargingPile(id='A', name='快充桩A', pile_type='fast', power_rating=30.0, status='available'),
+                ChargingPile(id='B', name='快充桩B', pile_type='fast', power_rating=30.0, status='available'),
+                ChargingPile(id='C', name='慢充桩C', pile_type='slow', power_rating=7.0, status='available'),
+                ChargingPile(id='D', name='慢充桩D', pile_type='slow', power_rating=7.0, status='available'),
+                ChargingPile(id='E', name='慢充桩E', pile_type='slow', power_rating=7.0, status='available'),
             ]
             
             for pile in sample_piles:
@@ -129,7 +131,7 @@ def create_app():
     # 初始化数据库
     init_database(app)
     
-    # 初始化充电服务
+    # 初始化充电服务（延迟初始化模式）
     init_charging_service(app, socketio)
     
     # 健康检查路由
@@ -170,18 +172,22 @@ def register_blueprints(app):
     print("✅ 所有API蓝图已注册")
 
 def init_charging_service(app, socketio):
-    """初始化充电服务"""
+    """初始化充电服务（延迟初始化模式）"""
     try:
         from services.charging_service import ChargingService
         
-        # 创建充电服务实例并初始化
-        charging_service = ChargingService(app=app, socketio=socketio)
+        # 创建充电服务实例（此时不会初始化应用上下文相关的内容）
+        charging_service = ChargingService()
         
         # 将服务实例注册到app扩展中
         if not hasattr(app, 'extensions'):
             app.extensions = {}
         app.extensions['charging_service'] = charging_service
         app.extensions['socketio'] = socketio
+        
+        # 在应用上下文中延迟初始化
+        with app.app_context():
+            charging_service.init_app(app, socketio)
         
         print("✅ 充电服务初始化完成")
         
@@ -210,10 +216,17 @@ if __name__ == '__main__':
     print("  ✅ WebSocket实时通信")
     print("=" * 60)
     
-    socketio.run(
-        app, 
-        debug=debug_mode, 
-        port=port,
-        host='0.0.0.0',
-        allow_unsafe_werkzeug=True
-    )
+    try:
+        socketio.run(
+            app, 
+            debug=debug_mode, 
+            port=port,
+            host='0.0.0.0',
+            allow_unsafe_werkzeug=True
+        )
+    except KeyboardInterrupt:
+        print("\n🛑 应用程序已停止")
+    except Exception as e:
+        print(f"\n❌ 应用程序启动失败: {e}")
+        import traceback
+        traceback.print_exc()
