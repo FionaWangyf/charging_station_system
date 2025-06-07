@@ -1,7 +1,8 @@
 from flask import Blueprint, request, session
 from models.user import db, User
+from services.billing_service import BillingService
 from utils.response import success_response, error_response, validation_error_response
-from utils.validators import validate_car_id, validate_username, validate_password, validate_car_capacity
+from utils.validators import validate_car_id, validate_username, validate_password, validate_car_capacity, validate_required_fields
 from functools import wraps
 
 # 创建蓝图
@@ -16,10 +17,26 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def admin_required(f):
+    """管理员权限验证装饰器"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return error_response("请先登录", code=401, error_type="LOGIN_REQUIRED")
+        
+        user_type = session.get('user_type')
+        if user_type != 'admin':
+            return error_response("需要管理员权限", code=403, error_type="PERMISSION_DENIED")
+        
+        return f(*args, **kwargs)
+    return decorated_function
+
 @user_bp.route('/test', methods=['GET'])
 def test():
     """测试接口"""
     return success_response(data={'message': '用户API正常运行'})
+
+# ==================== 认证相关 ====================
 
 @user_bp.route('/register', methods=['POST'])
 def register():
@@ -124,7 +141,7 @@ def login():
         if user.status != 'active':
             return error_response("账户已被禁用", code=403)
         
-        # 将用户ID存储在session中
+        # 将用户信息存储在session中
         session['user_id'] = user.id
         session['username'] = user.username
         session['user_type'] = user.user_type
@@ -150,6 +167,8 @@ def logout():
     except Exception as e:
         return error_response(f"登出失败: {str(e)}", code=500)
 
+# ==================== 用户信息管理 ====================
+
 @user_bp.route('/profile', methods=['GET'])
 @login_required
 def get_profile():
@@ -171,17 +190,7 @@ def get_profile():
     except Exception as e:
         return error_response(f"获取用户信息失败: {str(e)}", code=500)
 
-@user_bp.route('/session-info', methods=['GET'])
-def get_session_info():
-    """获取session信息（调试用）"""
-    return success_response(data={
-        'session_data': dict(session),
-        'is_logged_in': 'user_id' in session
-    })
-
-# ==================== 用户信息维护功能 ====================
-
-@user_bp.route('/update-profile', methods=['PUT'])
+@user_bp.route('/profile', methods=['PUT'])
 @login_required
 def update_profile():
     """更新用户个人信息"""
@@ -285,21 +294,116 @@ def change_password():
         db.session.rollback()
         return error_response(f"修改密码失败: {str(e)}", code=500)
 
-# ==================== 管理员功能 ====================
+# ==================== 充电详单功能 ====================
 
-def admin_required(f):
-    """管理员权限验证装饰器"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'user_id' not in session:
-            return error_response("请先登录", code=401, error_type="LOGIN_REQUIRED")
+@user_bp.route('/charging-records', methods=['GET'])
+@login_required
+def get_charging_records():
+    """获取用户充电详单列表"""
+    try:
+        user_id = session.get('user_id')
         
-        user_type = session.get('user_type')
-        if user_type != 'admin':
-            return error_response("需要管理员权限", code=403, error_type="PERMISSION_DENIED")
+        # 获取查询参数
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
+        start_date = request.args.get('start_date')  # YYYY-MM-DD
+        end_date = request.args.get('end_date')      # YYYY-MM-DD
         
-        return f(*args, **kwargs)
-    return decorated_function
+        # 限制每页数量
+        per_page = min(per_page, 50)
+        
+        # 获取充电记录
+        result = BillingService.get_user_charging_records(
+            user_id=user_id,
+            page=page,
+            per_page=per_page,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        return success_response(data=result, message="获取充电记录成功")
+        
+    except Exception as e:
+        return error_response(f"获取充电记录失败: {str(e)}", code=500)
+
+@user_bp.route('/charging-records/<int:record_id>', methods=['GET'])
+@login_required
+def get_charging_record_detail(record_id):
+    """获取充电详单详情"""
+    try:
+        user_id = session.get('user_id')
+        
+        # 获取记录详情
+        record_detail = BillingService.get_charging_record_detail(record_id, user_id)
+        
+        if record_detail:
+            return success_response(data=record_detail, message="获取充电详单详情成功")
+        else:
+            return error_response("充电记录不存在或无权访问", code=404)
+        
+    except Exception as e:
+        return error_response(f"获取充电详单详情失败: {str(e)}", code=500)
+
+@user_bp.route('/charging-summary', methods=['GET'])
+@login_required
+def get_charging_summary():
+    """获取用户充电汇总信息"""
+    try:
+        user_id = session.get('user_id')
+        
+        # 获取不同时间范围的汇总
+        # 本月汇总
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
+        month_result = BillingService.get_user_charging_records(
+            user_id=user_id,
+            page=1,
+            per_page=1000,  # 获取所有记录用于统计
+            start_date=month_start.isoformat()
+        )
+        
+        # 近30天汇总
+        thirty_days_ago = now - timedelta(days=30)
+        thirty_days_result = BillingService.get_user_charging_records(
+            user_id=user_id,
+            page=1,
+            per_page=1000,
+            start_date=thirty_days_ago.isoformat()
+        )
+        
+        summary_data = {
+            'current_month': {
+                'period': f"{month_start.strftime('%Y-%m')}-01 至今",
+                'total_records': month_result['summary']['total_records'],
+                'total_power_consumed': month_result['summary']['total_power_consumed'],
+                'total_cost': month_result['summary']['total_cost']
+            },
+            'last_30_days': {
+                'period': f"近30天",
+                'total_records': thirty_days_result['summary']['total_records'],
+                'total_power_consumed': thirty_days_result['summary']['total_power_consumed'],
+                'total_cost': thirty_days_result['summary']['total_cost']
+            }
+        }
+        
+        return success_response(data=summary_data, message="获取充电汇总成功")
+        
+    except Exception as e:
+        return error_response(f"获取充电汇总失败: {str(e)}", code=500)
+
+# ==================== 调试功能 ====================
+
+@user_bp.route('/session-info', methods=['GET'])
+def get_session_info():
+    """获取session信息（调试用）"""
+    return success_response(data={
+        'session_data': dict(session),
+        'is_logged_in': 'user_id' in session
+    })
+
+# ==================== 管理员功能 ====================
 
 @user_bp.route('/admin/users', methods=['GET'])
 @admin_required

@@ -6,7 +6,7 @@ import os
 # 加载环境变量
 load_dotenv()
 
-from config import config
+from config import get_config
 from models.user import db
 from database.init_db import init_database
 
@@ -15,20 +15,21 @@ def create_app():
     app = Flask(__name__)
     
     # 加载配置
-    config_name = os.environ.get('FLASK_ENV', 'development')
-    app.config.from_object(config[config_name])
-    
-    # Session配置
-    app.config['SESSION_COOKIE_HTTPONLY'] = True
-    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+    config_class = get_config()
+    app.config.from_object(config_class)
     
     # 初始化扩展
     db.init_app(app)
-    CORS(app, supports_credentials=True)  # 支持cookies
+    CORS(app, supports_credentials=True)
     
-    # 注册路由蓝图
+    # 注册API蓝图
     from api.user import user_bp
+    from api.billing import billing_bp
+    from api.statistics import statistics_bp
+    
     app.register_blueprint(user_bp, url_prefix='/api/user')
+    app.register_blueprint(billing_bp, url_prefix='/api/billing')
+    app.register_blueprint(statistics_bp, url_prefix='/api/statistics')
     
     # 初始化数据库
     init_database(app)
