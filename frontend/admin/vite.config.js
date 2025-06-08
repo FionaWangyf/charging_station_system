@@ -15,10 +15,16 @@ export default defineConfig({
     rollupOptions: {
       input: path.resolve(__dirname, './index.html'),
       output: {
-        manualChunks: {
-          'vue-vendor': ['vue', 'vue-router'],
-          'element-plus': ['element-plus'],
-          'vendor': ['axios']
+        manualChunks: (id) => {
+          if (id.includes('node_modules/vue') || id.includes('node_modules/vue-router')) {
+            return 'vue-vendor'
+          }
+          if (id.includes('node_modules/element-plus')) {
+            return 'element-plus'
+          }
+          if (id.includes('node_modules/axios')) {
+            return 'vendor'
+          }
         }
       }
     },

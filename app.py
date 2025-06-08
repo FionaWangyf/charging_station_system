@@ -110,7 +110,11 @@ def create_app():
     
     # 初始化扩展
     db.init_app(app)
-    CORS(app, supports_credentials=True)
+    CORS(app, 
+         origins=config_class.CORS_ORIGINS,
+         supports_credentials=True,
+         allow_headers=['Content-Type', 'Authorization'],
+         methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'])
     
     # 初始化SocketIO
     socketio = SocketIO(
@@ -141,10 +145,16 @@ def create_app():
     
     @app.route('/')
     def home():
+        """API首页和服务状态"""
         return {
             'message': '智能充电站管理系统API',
             'status': 'running',
             'version': '1.0.0',
+            'endpoints': {
+                'user_app': '/user',
+                'admin_app': 'http://localhost:5173',  # 管理员端独立运行
+                'api_docs': '/api'
+            },
             'modules': ['用户服务', '调度引擎', '充电控制', '计费系统', '统计分析']
         }
     # 配置静态文件服务
@@ -155,6 +165,18 @@ def create_app():
         if path and os.path.exists(os.path.join('static/dist', path)):
             return app.send_static_file(f'dist/{path}')
         return app.send_static_file('dist/index.html')
+    
+    @app.route('/user')
+    @app.route('/user/<path:path>')
+    def serve_user_app(path=''):
+        """服务用户端单页应用"""
+        # 检查是否是静态资源文件
+        if path and os.path.exists(os.path.join('static/user', path)):
+            return app.send_static_file(f'user/{path}')
+        
+        # 所有路由都返回 index.html，让前端路由处理
+        return app.send_static_file('user/index.html')
+
     
     return app, socketio
 

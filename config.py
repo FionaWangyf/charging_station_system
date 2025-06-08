@@ -92,6 +92,14 @@ class Config:
     API_TITLE = '充电桩管理系统API'
     API_DESCRIPTION = '充电桩管理系统的RESTful API接口'
 
+    # CORS配置 - 允许管理员端访问
+    CORS_ORIGINS = [
+        "http://localhost:3000",  # 用户端开发服务器
+        "http://localhost:5173",  # 管理员端开发服务器
+        "http://localhost:5001",  # 生产环境
+    ]
+    CORS_SUPPORTS_CREDENTIALS = True
+
 class DevelopmentConfig(Config):
     """开发环境配置"""
     DEBUG = True
