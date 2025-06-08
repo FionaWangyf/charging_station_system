@@ -29,3 +29,57 @@ npm run dev
 
 在.env中配置自己的数据库用户名、密码等敏感信息 \
 提前创建好数据库
+
+
+frontend
+├─ 📁admin
+│  ├─ 📁public
+│  │  └─ 📄vite.svg
+│  ├─ 📁src
+│  │  ├─ 📁assets
+│  │  │  └─ 📄vue.svg
+│  │  ├─ 📁components
+│  │  │  ├─ 📄ChargingPileTable.vue
+│  │  │  ├─ 📄ReportTable.vue
+│  │  │  ├─ 📄SidebarMenu.vue
+│  │  │  ├─ 📄TopBar.vue
+│  │  │  └─ 📄WaitingPileCard.vue
+│  │  ├─ 📁router
+│  │  │  └─ 📄index.js
+│  │  ├─ 📁styles
+│  │  │  └─ 📄global.css
+│  │  ├─ 📁views
+│  │  │  ├─ 📄ChargingPileView.vue
+│  │  │  ├─ 📄ReportView.vue
+│  │  │  └─ 📄WaitingVehiclesView.vue
+│  │  ├─ 📄.DS_Store
+│  │  ├─ 📄App.vue
+│  │  ├─ 📄main.js
+│  │  └─ 📄style.css
+│  ├─ 📄.DS_Store
+│  ├─ 📄index.html
+│  ├─ 📄package-lock.json
+│  ├─ 📄package.json
+│  └─ 📄vite.config.js
+├─ 📁user
+│  ├─ 📁public
+│  │  ├─ 📄LoginBackground.jpg
+│  │  └─ 📄desktop.ini
+│  ├─ 📁src
+│  │  ├─ 📁assets
+│  │  │  └─ 📄style.css
+│  │  ├─ 📁components
+│  │  │  ├─ 📄ChargingDetailsPage.vue
+│  │  │  ├─ 📄LoginPage.vue
+│  │  │  ├─ 📄MainPage.vue
+│  │  │  ├─ 📄NotificationPopup.vue
+│  │  │  └─ 📄RegisterPage.vue
+│  │  ├─ 📄App.vue
+│  │  ├─ 📄env.d.ts
+│  │  ├─ 📄main.ts
+│  ├─ 📄index.html
+│  ├─ 📄package-lock.json
+│  ├─ 📄package.json
+│  ├─ 📄tsconfig.json
+│  ├─ 📄tsconfig.node.json
+│  └─ 📄vite.config.ts

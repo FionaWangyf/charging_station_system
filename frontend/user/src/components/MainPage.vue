@@ -37,8 +37,10 @@
                 <span class="info-value">{{ userInfo.username || 'xxxx' }}</span>
               </div>
               <div class="info-row">
-                <span class="info-label">密码：</span>
-                <span class="info-value">{{ userInfo.password || 'xxxx' }}</span>
+                <span class="info-label">状态：</span>
+                <span class="info-value" :class="{ 'online': isConnected }">
+                  {{ isConnected ? '在线' : '离线' }}
+                </span>
               </div>
             </div>
             <button class="reset-password-btn" @click="resetPassword">
@@ -52,7 +54,10 @@
             查看充电详单
           </button>
           <button class="action-btn secondary" @click="modifyChargingRequest">
-            修改充电请求
+            提交充电请求
+          </button>
+          <button class="action-btn logout" @click="logout">
+            退出登录
           </button>
         </div>
       </div>
@@ -61,28 +66,73 @@
       <div class="queue-section">
         <div class="queue-info">
           <h3 class="queue-title">本车排队号码：</h3>
-          <div class="queue-number">{{ queueInfo.isStopped ? '--' : queueInfo.currentNumber }}</div>
+          <div class="queue-number">{{ displayQueueInfo.isStopped ? '--' : displayQueueInfo.currentNumber }}</div>
         </div>
 
         <div class="waiting-info">
           <span class="waiting-text">您前方还有</span>
-          <span class="waiting-number">{{ queueInfo.isStopped ? '--' : queueInfo.waitingCount }}</span>
+          <span class="waiting-number">{{ displayQueueInfo.isStopped ? '--' : displayQueueInfo.waitingCount }}</span>
           <span class="waiting-text">辆</span>
         </div>
 
-        <div v-if="!queueInfo.isStopped" class="status-info">
-          <div class="status-text" :class="{ 'charging': queueInfo.waitingCount === 0 }">
-            {{ queueInfo.waitingCount === 0 ? '正在充电...' : queueInfo.status }}
+        <div v-if="!displayQueueInfo.isStopped" class="status-info">
+          <div class="status-text" :class="{ 'charging': displayQueueInfo.waitingCount === 0 }">
+            {{ displayQueueInfo.waitingCount === 0 ? '正在充电...' : displayQueueInfo.status }}
           </div>
-          <div v-if="queueInfo.waitingCount === 0" class="charging-controls">
+          
+          <!-- 显示预估等待时间 -->
+          <div v-if="displayQueueInfo.estimatedWaitTime && displayQueueInfo.waitingCount > 0" class="estimated-time">
+            预估等待时间：{{ Math.ceil(displayQueueInfo.estimatedWaitTime / 60) }} 分钟
+          </div>
+          
+          <div v-if="displayQueueInfo.waitingCount === 0" class="charging-controls">
             <button class="stop-charging-btn" @click="stopCharging">
               停止充电
             </button>
+            
+            <!-- 显示充电信息 -->
+            <div v-if="displayChargingSession" class="charging-info">
+              <div class="charging-detail">
+                <span>充电桩：{{ displayChargingSession.pileId }}</span>
+              </div>
+              <div class="charging-detail">
+                <span>已充电量：{{ displayChargingSession.powerConsumed.toFixed(1) }} kWh</span>
+              </div>
+              <div class="charging-detail">
+                <span>充电时长：{{ Math.floor(displayChargingSession.chargingDuration / 60) }} 分钟</span>
+              </div>
+            </div>
           </div>
+          
           <div v-else class="loading-dots">
             <span class="dot"></span>
             <span class="dot"></span>
             <span class="dot"></span>
+          </div>
+        </div>
+
+        <!-- WebSocket 连接状态提示 -->
+        <div v-if="!isConnected" class="connection-warning">
+          <span class="warning-icon">⚠️</span>
+          <span class="warning-text">实时更新已断开，排队信息可能不是最新的</span>
+        </div>
+      </div>
+      
+      <!-- 系统状态信息 -->
+      <div v-if="isConnected" class="system-status">
+        <h4>系统状态</h4>
+        <div class="status-grid">
+          <div class="status-item">
+            <span class="status-label">排队中</span>
+            <span class="status-value">{{ systemStatus.totalQueuing }}</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">充电中</span>
+            <span class="status-value">{{ systemStatus.totalCharging }}</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">可用充电桩</span>
+            <span class="status-value">{{ systemStatus.availablePiles }}</span>
           </div>
         </div>
       </div>
@@ -102,7 +152,7 @@
             <select v-model="chargingRequest.mode" class="form-select">
               <option value="">请选择充电模式</option>
               <option value="fast">快充</option>
-              <option value="slow">慢充</option>
+              <option value="trickle">慢充</option>
             </select>
           </div>
 
@@ -166,25 +216,54 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
+import { useWebSocket } from '@/composables/useWebSocket'
+import type { QueueInfo, ChargingSession } from '@/types/websocket'
+
+// 定义 Props（从 App.vue 传入的 WebSocket 数据）
+interface Props {
+  queueInfo?: QueueInfo
+  chargingSession?: ChargingSession | null
+}
+
+const props = withDefaults(defineProps<Props>(), {
+  queueInfo: () => ({
+    currentNumber: '--',
+    waitingCount: 0,
+    status: '未排队',
+    isStopped: true
+  }),
+  chargingSession: null
+})
 
 // 定义事件
 const emit = defineEmits<{
   switchToChargingDetails: []
+  logout: []
 }>()
 
-// 用户信息
+// 使用 WebSocket 组合式 API
+const {
+  isConnected,
+  requestSystemStatus,
+  systemStatus,
+  disconnect
+} = useWebSocket()
+
+// 原有的本地状态（保持兼容性）
 const userInfo = ref({
   username: '',
   password: '',
 })
 
-// 排队信息，这里要从后端获取排队号和等待车辆数量
-const queueInfo = ref({
-  currentNumber: 'F1',
-  waitingCount: 2,
-  status: '排队中，请等候',
-  isStopped: true //true表示并未加入排队，false表示已加入排队，在页面中显示排队信息
+// 使用传入的排队信息，如果没有传入则使用本地状态
+const displayQueueInfo = computed(() => {
+  return props.queueInfo
+})
+
+// 使用传入的充电会话信息
+const displayChargingSession = computed(() => {
+  return props.chargingSession
 })
 
 // 弹窗状态
@@ -214,6 +293,14 @@ const isPasswordFormValid = computed(() => {
   return passwordForm.value.oldPassword && passwordForm.value.newPassword
 })
 
+// 监听 WebSocket 连接状态
+watch(isConnected, (connected) => {
+  if (connected) {
+    console.log('✅ WebSocket 已连接，请求系统状态更新')
+    requestSystemStatus()
+  }
+})
+
 // 组件挂载时获取用户信息
 onMounted(() => {
   // 从localStorage获取用户信息
@@ -227,27 +314,11 @@ onMounted(() => {
     }
   }
 
-  // 模拟获取排队信息（实际应该从后端API获取）
-  //fetchQueueInfo()
-
-  // 模拟排队进度变化（仅用于演示）
-  //simulateQueueProgress()
-})
-
-// 获取排队信息
-const fetchQueueInfo = async () => {
-  try {
-    // 这里应该调用实际的API
-    // const response = await fetch('/api/queue/status')
-    // const data = await response.json()
-    // queueInfo.value = data
-
-    // 模拟数据
-    console.log('获取排队信息...')
-  } catch (error) {
-    console.error('获取排队信息失败:', error)
+  // 如果 WebSocket 已连接，请求系统状态
+  if (isConnected.value) {
+    requestSystemStatus()
   }
-}
+})
 
 // 重置密码
 const resetPassword = () => {
@@ -262,6 +333,20 @@ const viewChargingDetails = () => {
 // 修改充电请求
 const modifyChargingRequest = () => {
   showChargingModal.value = true
+}
+
+// 退出登录
+const logout = () => {
+  if (confirm('确定要退出登录吗？')) {
+    // 清除本地存储
+    localStorage.removeItem('userInfo')
+    
+    // 断开 WebSocket 连接
+    disconnect()
+    
+    // 触发退出登录事件
+    emit('logout')
+  }
 }
 
 // 关闭充电请求弹窗
@@ -284,12 +369,20 @@ const closePasswordModal = () => {
   }
 }
 
-// 提交充电请求
+// 提交充电请求（更新后的版本）
+// 提交充电请求（健壮错误处理版本）
 const submitChargingRequest = async () => {
   if (!isFormValid.value) {
     alert('请完整填写充电信息')
     return
   }
+
+  const requestData = {
+    charging_mode: chargingRequest.value.mode,
+    requested_amount: Number(chargingRequest.value.amount)
+  }
+
+  console.log('📤 准备发送充电请求:', requestData)
 
   try {
     const response = await fetch('/api/charging/request', {
@@ -298,28 +391,104 @@ const submitChargingRequest = async () => {
         'Content-Type': 'application/json',
       },
       credentials: 'include',
-      body: JSON.stringify({
-        charging_mode: chargingRequest.value.mode,
-        requested_amount: Number(chargingRequest.value.amount)
-      })
+      body: JSON.stringify(requestData)
     })
 
-    const result = await response.json()
+    console.log('📥 收到响应:', {
+      status: response.status,
+      statusText: response.statusText,
+      ok: response.ok,
+      headers: Object.fromEntries(response.headers.entries())
+    })
 
+    // 获取响应文本
+    let responseText = ''
+    try {
+      responseText = await response.text()
+      console.log('📄 响应原始内容:', responseText)
+    } catch (textError) {
+      console.error('❌ 读取响应内容失败:', textError)
+      alert('无法读取服务器响应，请稍后重试')
+      return
+    }
+
+    // 检查是否有响应内容
+    if (!responseText || responseText.trim() === '') {
+      console.error('❌ 服务器返回空响应')
+      alert(`服务器错误 (${response.status}): 服务器返回空响应，请检查后端日志`)
+      return
+    }
+
+    // 尝试解析JSON
+    let result
+    try {
+      result = JSON.parse(responseText)
+      console.log('✅ JSON解析成功:', result)
+    } catch (parseError) {
+      console.error('❌ JSON解析失败:', parseError)
+      console.log('📄 无法解析的内容:', responseText.substring(0, 200))
+      
+      // 如果是HTML错误页面
+      if (responseText.includes('<html>') || responseText.includes('<!DOCTYPE')) {
+        alert('服务器返回了HTML错误页面，可能是内部错误。请检查后端日志。')
+      } else {
+        alert(`服务器响应格式错误:\n${responseText.substring(0, 100)}...`)
+      }
+      return
+    }
+
+    // 处理HTTP状态码
+    if (!response.ok) {
+      console.error('❌ HTTP错误状态:', response.status)
+      const errorMessage = result?.message || result?.error || `服务器错误 (${response.status})`
+      alert(`提交失败: ${errorMessage}`)
+      return
+    }
+
+    // 检查业务逻辑成功
     if (response.status === 201 && result.success === true) {
+      console.log('🎉 充电请求提交成功')
       alert(`充电请求已提交！\n充电模式：${chargingRequest.value.mode === 'fast' ? '快充' : '慢充'}\n充电量：${chargingRequest.value.amount}kWh`)
       closeModal()
       
-      // 更新排队信息
-      queueInfo.value.isStopped = false
-      queueInfo.value.waitingCount = 2 // 或从API获取实际数据
+      // 请求更新系统状态
+      if (isConnected.value) {
+        requestSystemStatus()
+      }
+      
+      // 延迟获取状态更新
+      setTimeout(() => {
+        if (typeof fetchSystemStatusViaHTTP === 'function') {
+          fetchSystemStatusViaHTTP()
+        }
+        if (typeof fetchUserStatusViaHTTP === 'function') {
+          fetchUserStatusViaHTTP()
+        }
+      }, 1000)
       
     } else {
-      alert(result.message || '提交失败，请稍后重试')
+      console.warn('⚠️ 业务逻辑失败:', result)
+      const errorMsg = result?.message || result?.msg || '提交失败，请稍后重试'
+      alert(`提交失败: ${errorMsg}`)
     }
+
   } catch (error) {
-    console.error('提交充电请求失败:', error)
-    alert('网络错误，请稍后重试')
+    console.error('💥 提交充电请求异常:', error)
+    
+    // 详细的错误分类
+    if (error instanceof TypeError) {
+      if (error.message.includes('fetch')) {
+        alert('网络连接失败，请检查网络连接')
+      } else if (error.message.includes('json')) {
+        alert('服务器响应格式错误')
+      } else {
+        alert(`网络错误: ${error.message}`)
+      }
+    } else if (error instanceof SyntaxError) {
+      alert('服务器响应解析错误，请联系管理员')
+    } else {
+      alert(`未知错误: ${error.message || '请稍后重试'}`)
+    }
   }
 }
 
@@ -359,63 +528,38 @@ const submitPasswordReset = async () => {
   }
 }
 
-// 停止充电
-const stopCharging = () => {
-  if (confirm('确定要停止充电吗？')) {
-    // 这里应该调用后端API停止充电
-    alert('充电已停止')
-    // 设置为停止状态
-    queueInfo.value.isStopped = true
+// 停止充电（更新后的版本）
+const stopCharging = async () => {
+  if (!confirm('确定要停止充电吗？')) {
+    return
+  }
+
+  try {
+    const response = await fetch('/api/charging/stop', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      credentials: 'include'
+    })
+
+    const result = await response.json()
+
+    if (response.ok && result.success === true) {
+      alert('充电已停止')
+      
+      // 请求更新系统状态
+      if (isConnected.value) {
+        requestSystemStatus()
+      }
+    } else {
+      alert(result.message || '停止充电失败，请稍后重试')
+    }
+  } catch (error) {
+    console.error('停止充电失败:', error)
+    alert('网络错误，请稍后重试')
   }
 }
-
-/* 用于测试的部分
-// 模拟排队进度变化（仅用于演示）
-const simulateQueueProgress = () => {
-  // 注释掉自动变化，改为手动测试
-  // setTimeout(() => {
-  //   if (queueInfo.value.waitingCount > 0) {
-  //     queueInfo.value.waitingCount--
-  //     simulateQueueProgress()
-  //   }
-  // }, 5000) // 每5秒减少一辆车
-}
-
-// 测试方法：切换充电状态
-const toggleChargingStatus = () => {
-  if (queueInfo.value.isStopped) {
-    // 如果已停止，重新开始排队
-    queueInfo.value.isStopped = false
-    queueInfo.value.waitingCount = 2
-  } else if (queueInfo.value.waitingCount === 0) {
-    // 如果正在充电，模拟排队
-    queueInfo.value.waitingCount = 2
-  } else {
-    // 如果正在排队，模拟开始充电
-    queueInfo.value.waitingCount = 0
-  }
-}
-
-// 获取测试按钮文字
-const getTestButtonText = () => {
-  if (queueInfo.value.isStopped) {
-    return '模拟重新排队'
-  } else if (queueInfo.value.waitingCount === 0) {
-    return '模拟排队'
-  } else {
-    return '模拟开始充电'
-  }
-}
-
-// 重新排队
-const restartQueue = () => {
-  queueInfo.value.isStopped = false
-  queueInfo.value.waitingCount = 2
-  queueInfo.value.currentNumber = 'F1'
-  alert('已重新加入排队')
-}
-*/
-
 </script>
 
 <style scoped>
@@ -563,6 +707,10 @@ const restartQueue = () => {
   font-weight: 500;
 }
 
+.info-value.online {
+  color: #27ae60;
+}
+
 .reset-password-btn {
   background: transparent;
   border: 2px solid #3498db;
@@ -618,26 +766,216 @@ const restartQueue = () => {
   box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
 }
 
-.action-btn.test {
-  background: #95a5a6;
+.action-btn.logout {
+  background: #e74c3c;
   color: white;
+}
+
+.action-btn.logout:hover {
+  background: #c0392b;
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(231, 76, 60, 0.4);
+}
+
+/* 队列和系统状态样式保持您原有的样式 */
+.queue-section {
+  background: white;
+  border-radius: 12px;
+  padding: 40px;
+  text-align: center;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+  margin-bottom: 20px;
+}
+
+.queue-info {
+  margin-bottom: 40px;
+}
+
+.queue-title {
+  font-size: 24px;
+  color: #2c3e50;
+  margin: 0 0 20px 0;
+  font-weight: 500;
+}
+
+.queue-number {
+  font-size: 120px;
+  font-weight: 700;
+  color: #e74c3c;
+  line-height: 1;
+  margin-bottom: 20px;
+  text-shadow: 2px 2px 4px rgba(231, 76, 60, 0.2);
+}
+
+.waiting-info {
+  font-size: 28px;
+  margin-bottom: 30px;
+  color: #2c3e50;
+}
+
+.waiting-text {
+  color: #2c3e50;
+}
+
+.waiting-number {
+  font-size: 40px;
+  font-weight: 700;
+  color: #e74c3c;
+  margin: 0 10px;
+}
+
+.status-info {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex-direction: column;
+}
+
+.status-text {
+  font-size: 20px;
+  color: #7f8c8d;
+}
+
+.status-text.charging {
+  color: #3498db;
+  font-weight: 600;
+}
+
+.estimated-time {
   font-size: 14px;
+  color: #666;
+  margin-top: 10px;
 }
 
-.action-btn.test:hover {
-  background: #7f8c8d;
-  transform: translateY(-2px);
+.charging-controls {
+  margin-top: 20px;
 }
 
-.action-btn.restart {
-  background: #27ae60;
+.stop-charging-btn {
+  background: #e74c3c;
   color: white;
+  border: none;
+  padding: 12px 24px;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s ease;
 }
 
-.action-btn.restart:hover {
-  background: #229954;
+.stop-charging-btn:hover {
+  background: #c0392b;
   transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(39, 174, 96, 0.4);
+  box-shadow: 0 6px 20px rgba(231, 76, 60, 0.4);
+}
+
+.charging-info {
+  margin-top: 15px;
+  padding: 15px;
+  background: rgba(52, 152, 219, 0.1);
+  border-radius: 8px;
+  border: 1px solid rgba(52, 152, 219, 0.2);
+}
+
+.charging-detail {
+  font-size: 14px;
+  color: #2c3e50;
+  margin-bottom: 5px;
+}
+
+.charging-detail:last-child {
+  margin-bottom: 0;
+}
+
+.loading-dots {
+  display: flex;
+  gap: 4px;
+  justify-content: center;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  background: #7f8c8d;
+  border-radius: 50%;
+  animation: loading 1.4s infinite ease-in-out;
+}
+
+.dot:nth-child(1) { animation-delay: -0.32s; }
+.dot:nth-child(2) { animation-delay: -0.16s; }
+
+@keyframes loading {
+  0%, 80%, 100% {
+    transform: scale(0.8);
+    opacity: 0.5;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.connection-warning {
+  margin-top: 20px;
+  padding: 12px 16px;
+  background: rgba(255, 193, 7, 0.1);
+  border: 1px solid rgba(255, 193, 7, 0.3);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.warning-icon {
+  font-size: 16px;
+}
+
+.warning-text {
+  font-size: 14px;
+  color: #856404;
+}
+
+.system-status {
+  background: white;
+  border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+}
+
+.system-status h4 {
+  font-size: 18px;
+  font-weight: 600;
+  color: #2c3e50;
+  margin: 0 0 15px 0;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 15px;
+}
+
+.status-item {
+  text-align: center;
+  padding: 12px;
+  background: #f8f9fa;
+  border-radius: 8px;
+  border: 1px solid #e9ecef;
+}
+
+.status-label {
+  display: block;
+  font-size: 12px;
+  color: #666;
+  margin-bottom: 4px;
+}
+
+.status-value {
+  display: block;
+  font-size: 20px;
+  font-weight: 700;
+  color: #2c3e50;
 }
 
 /* 弹窗样式 */
@@ -818,119 +1156,6 @@ const restartQueue = () => {
   box-shadow: none;
 }
 
-/* 排队信息区域 */
-.queue-section {
-  background: white;
-  border-radius: 12px;
-  padding: 40px;
-  text-align: center;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
-}
-
-.queue-info {
-  margin-bottom: 40px;
-}
-
-.queue-title {
-  font-size: 24px;
-  color: #2c3e50;
-  margin: 0 0 20px 0;
-  font-weight: 500;
-}
-
-.queue-number {
-  font-size: 120px;
-  font-weight: 700;
-  color: #e74c3c;
-  line-height: 1;
-  margin-bottom: 20px;
-  text-shadow: 2px 2px 4px rgba(231, 76, 60, 0.2);
-}
-
-.waiting-info {
-  font-size: 28px;
-  margin-bottom: 30px;
-  color: #2c3e50;
-}
-
-.waiting-text {
-  color: #2c3e50;
-}
-
-.waiting-number {
-  font-size: 40px;
-  font-weight: 700;
-  color: #e74c3c;
-  margin: 0 10px;
-}
-
-.status-info {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  flex-direction: column;
-}
-
-.status-text {
-  font-size: 20px;
-  color: #7f8c8d;
-}
-
-.status-text.charging {
-  color: #3498db;
-  font-weight: 600;
-}
-
-.charging-controls {
-  margin-top: 20px;
-}
-
-.stop-charging-btn {
-  background: #e74c3c;
-  color: white;
-  border: none;
-  padding: 12px 24px;
-  border-radius: 8px;
-  font-size: 16px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.3s ease;
-}
-
-.stop-charging-btn:hover {
-  background: #c0392b;
-  transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(231, 76, 60, 0.4);
-}
-
-.loading-dots {
-  display: flex;
-  gap: 4px;
-}
-
-.dot {
-  width: 8px;
-  height: 8px;
-  background: #7f8c8d;
-  border-radius: 50%;
-  animation: loading 1.4s infinite ease-in-out;
-}
-
-.dot:nth-child(1) { animation-delay: -0.32s; }
-.dot:nth-child(2) { animation-delay: -0.16s; }
-
-@keyframes loading {
-  0%, 80%, 100% {
-    transform: scale(0.8);
-    opacity: 0.5;
-  }
-  40% {
-    transform: scale(1);
-    opacity: 1;
-  }
-}
-
 /* 响应式设计 */
 @media (max-width: 1024px) {
   .user-section {
@@ -970,6 +1195,39 @@ const restartQueue = () => {
 
   .action-buttons {
     flex-direction: column;
+  }
+
+  .charging-info {
+    padding: 12px;
+  }
+  
+  .charging-detail {
+    font-size: 13px;
+  }
+  
+  .connection-warning {
+    padding: 10px 12px;
+  }
+  
+  .warning-text {
+    font-size: 13px;
+  }
+  
+  .system-status {
+    padding: 15px;
+  }
+  
+  .status-grid {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+  }
+  
+  .status-item {
+    padding: 8px;
+  }
+  
+  .status-value {
+    font-size: 16px;
   }
 }
 

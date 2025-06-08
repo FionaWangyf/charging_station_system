@@ -87,9 +87,18 @@
 import { reactive, ref, onUnmounted } from 'vue'
 
 // 定义事件
-defineEmits<{
+const emit = defineEmits<{
   switchToLogin: []
 }>()
+
+// 注册成功后的处理
+const handleRegisterSuccess = (result: any) => {
+  console.log('注册成功:', result)
+  alert('注册成功！请登录')
+  
+  // 正确使用 emit 函数
+  emit('switchToLogin')
+}
 
 interface RegisterForm {
   username: string

@@ -1,58 +1,10 @@
-<template>
-  <div class="login-container">
-    <div class="background-overlay"></div>
-
-    <div class="login-content">
-      <h1 class="title">智能充电桩系统平台</h1>
-
-      <div class="login-form">
-        <div class="form-group">
-          <input
-            v-model="loginForm.username"
-            type="text"
-            placeholder="请输入账号"
-            class="form-input"
-            :disabled="loading"
-          />
-        </div>
-
-        <div class="form-group">
-          <input
-            v-model="loginForm.password"
-            type="password"
-            placeholder="请输入密码"
-            class="form-input"
-            :disabled="loading"
-            @keyup.enter="handleLogin"
-          />
-        </div>
-
-        <!-- 错误提示 -->
-        <div v-if="errorMessage" class="error-message">
-          {{ errorMessage }}
-        </div>
-
-        <button @click="handleLogin" class="login-button" :disabled="loading">
-          <span v-if="loading">登录中...</span>
-          <span v-else>登 录</span>
-        </button>
-
-        <div class="form-links">
-          <a href="#" class="link" @click.prevent="emit('switchToRegister')">注册</a>
-        </div>
-      </div>
-    </div>
-  </div>
-</template>
-
 <script setup lang="ts">
 import { reactive, ref} from 'vue'
 
 const emit = defineEmits<{
   switchToRegister: []
-  loginSuccess: []     // 新增：登录成功事件
+  loginSuccess: [userInfo: any]     // 修改：明确指定参数类型
 }>()
-
 
 interface LoginForm {
   username: string
@@ -95,11 +47,9 @@ const handleLogin = async (): Promise<void> => {
 
   loading.value = true
 
-  
   try {
-
     // 请根据你的实际后端接口地址修改URL
-    const response =await fetch('/api/user/login', {
+    const response = await fetch('/api/user/login', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -111,6 +61,7 @@ const handleLogin = async (): Promise<void> => {
         password: loginForm.password
       })
     })
+    
     console.log('📡 请求已发送，等待响应...')
     console.log('📥 响应对象:', response)
     const result = await response.json()
@@ -120,15 +71,27 @@ const handleLogin = async (): Promise<void> => {
       // 登录成功
       console.log('登录成功:', result)
 
-      // 存储用户信息
-      if (result.data?.user_info) {
-        localStorage.setItem('userInfo', JSON.stringify(result.data.user_info))
+      // 构造标准化的用户信息对象
+      const userInfo = {
+        user_id: result.data?.user_info?.user_id || result.data?.user_id || result.data?.id,
+        id: result.data?.user_info?.user_id || result.data?.user_id || result.data?.id,
+        username: result.data?.user_info?.username || result.data?.username || loginForm.username,
+        car_id: result.data?.user_info?.car_id || result.data?.car_id,
+        car_capacity: result.data?.user_info?.car_capacity || result.data?.car_capacity,
+        // 保留完整的原始数据
+        ...result.data?.user_info,
+        ...result.data
       }
 
-      // 发出登录成功事件，跳转到主界面
-      emit('loginSuccess')
+      console.log('📋 标准化用户信息:', userInfo)
 
-      } else {
+      // 存储用户信息到 localStorage
+      localStorage.setItem('userInfo', JSON.stringify(userInfo))
+
+      // 发出登录成功事件，传递用户信息
+      emit('loginSuccess', userInfo)  // ✅ 正确传递用户数据
+
+    } else {
       // 登录失败 - 显示服务器返回的具体错误消息
       const errorMsg = result.message || result.msg || '用户名或密码错误'
       showError(errorMsg)
@@ -146,11 +109,58 @@ const handleLogin = async (): Promise<void> => {
   } finally {
     loading.value = false
   }
-
 }
-
 </script>
 
+<!-- template 部分保持不变 -->
+<template>
+  <div class="login-container">
+    <div class="background-overlay"></div>
+
+    <div class="login-content">
+      <h1 class="title">智能充电桩系统平台</h1>
+
+      <div class="login-form">
+        <div class="form-group">
+          <input
+            v-model="loginForm.username"
+            type="text"
+            placeholder="请输入账号"
+            class="form-input"
+            :disabled="loading"
+          />
+        </div>
+
+        <div class="form-group">
+          <input
+            v-model="loginForm.password"
+            type="password"
+            placeholder="请输入密码"
+            class="form-input"
+            :disabled="loading"
+            @keyup.enter="handleLogin"
+          />
+        </div>
+
+        <!-- 错误提示 -->
+        <div v-if="errorMessage" class="error-message">
+          {{ errorMessage }}
+        </div>
+
+        <button @click="handleLogin" class="login-button" :disabled="loading">
+          <span v-if="loading">登录中...</span>
+          <span v-else">登 录</span>
+        </button>
+
+        <div class="form-links">
+          <a href="#" class="link" @click.prevent="emit('switchToRegister')">注册</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<!-- style 部分保持不变 -->
 <style scoped>
 .login-container {
   position: relative;
@@ -268,7 +278,6 @@ const handleLogin = async (): Promise<void> => {
   font-size: 14px;
   animation: slideIn 0.3s ease-out;
 }
-
 
 /* 响应式设计 */
 @media (max-width: 480px) {

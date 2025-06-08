@@ -23,6 +23,18 @@ export default defineConfig({
             console.log('📥 代理响应:', proxyRes.statusCode, req.url);
           });
         }
+      },
+      // WebSocket 代理配置
+      '/socket.io': {
+        target: 'http://127.0.0.1:5001',
+        changeOrigin: true,
+        ws: true,
+        secure: false,
+        configure: (proxy, _options) => {
+          proxy.on('error', (err, _req, _res) => {
+            console.log('❌ WebSocket 代理错误:', err);
+          });
+        }
       }
     }
   },
