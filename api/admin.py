@@ -37,7 +37,10 @@ def start_pile():
             return error_response("充电桩不存在", code=404)
         
         if pile.status == 'available':
-            return error_response("充电桩已经在线", code=400)
+            return success_response(
+                data={'pile_id': pile_id, 'status': 'available'},
+                message=f'充电桩 {pile_id} 已经是启动状态'
+            )
         
         # 更新数据库状态
         pile.status = 'available'

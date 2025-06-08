@@ -102,53 +102,58 @@ class StatisticsService:
     
     @staticmethod
     def get_daily_statistics(days: int = 7) -> List[Dict]:
-        """获取日统计数据"""
+        """获取日统计数据 - 按充电桩分组"""
         try:
             end_date = datetime.now().date()
             start_date = end_date - timedelta(days=days-1)
             
-            # 查询每日统计
-            daily_query = db.session.query(
-                func.date(ChargingRecord.created_at).label('date'),
+            # 按充电桩分组查询统计数据
+            pile_query = db.session.query(
+                ChargingRecord.pile_id,
                 func.count(ChargingRecord.id).label('charging_count'),
                 func.sum(ChargingRecord.total_fee).label('revenue'),
-                func.sum(ChargingRecord.power_consumed).label('power_consumed')
+                func.sum(ChargingRecord.power_consumed).label('power_consumed'),
+                #func.sum(ChargingRecord.charging_duration).label('total_duration')
             ).filter(
-                and_(
-                    func.date(ChargingRecord.created_at) >= start_date,
-                    func.date(ChargingRecord.created_at) <= end_date,
-                    ChargingRecord.status == 'completed'
-                )
-            ).group_by(func.date(ChargingRecord.created_at)).all()
+                ChargingRecord.status == 'completed',
+                func.date(ChargingRecord.created_at) >= start_date,
+                func.date(ChargingRecord.created_at) <= end_date
+            ).group_by(ChargingRecord.pile_id).all()
             
-            # 创建结果字典
-            result_dict = {}
-            for row in daily_query:
-                result_dict[row.date] = {
-                    'date': row.date.isoformat(),
-                    'charging_count': row.charging_count,
-                    'revenue': float(row.revenue or 0),
-                    'power_consumed': float(row.power_consumed or 0)
+            # 获取所有充电桩信息，确保没有数据的充电桩也显示
+            from models.billing import ChargingPile
+            all_piles = ChargingPile.query.all()
+            
+            # 构建结果
+            result = []
+            for pile in all_piles:
+                pile_data = {
+                    'pile_id': pile.id,
+                    'charging_count': 0,
+                    'revenue': 0.0,
+                    'power_consumed': 0.0,
+                    #'total_duration': 0.0
                 }
+                
+                # 查找对应的统计数据
+                for row in pile_query:
+                    if row.pile_id == pile.id:
+                        pile_data.update({
+                            'charging_count': row.charging_count or 0,
+                            'revenue': float(row.revenue or 0),
+                            'power_consumed': float(row.power_consumed or 0),
+                            #'total_duration': float(row.total_duration or 0)
+                        })
+                        break
+                
+                result.append(pile_data)
             
-            # 填充缺失日期
-            daily_stats = []
-            current_date = start_date
-            while current_date <= end_date:
-                if current_date in result_dict:
-                    daily_stats.append(result_dict[current_date])
-                else:
-                    daily_stats.append({
-                        'date': current_date.isoformat(),
-                        'charging_count': 0,
-                        'revenue': 0.0,
-                        'power_consumed': 0.0
-                    })
-                current_date += timedelta(days=1)
+            return result
             
-            return daily_stats
         except Exception as e:
-            print(f"获取日统计失败: {e}")
+            print(f"获取日统计数据失败: {e}")
+            import traceback
+            traceback.print_exc()
             return []
     
     @staticmethod
@@ -335,7 +340,9 @@ def get_overview():
 def get_daily():
     """获取日统计数据"""
     days = request.args.get('days', default=7, type=int)
-    return jsonify(statistics_service.get_daily_statistics(days))
+    from utils.response import success_response
+    return success_response(data=statistics_service.get_daily_statistics(days))
+    #return jsonify(statistics_service.get_daily_statistics(days))
 
 @statistics_bp.route('/hourly', methods=['GET'])
 def get_hourly():

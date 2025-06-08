@@ -1,4 +1,6 @@
 <template>
+
+    <!-- 你现有的列定义 -->
   <el-table :data="report" border stripe style="width: 100%">
     <el-table-column prop="id" label="充电桩编号" width="180" />
     <el-table-column prop="count" label="累计充电次数" width="200" />
