@@ -147,6 +147,14 @@ def create_app():
             'version': '1.0.0',
             'modules': ['用户服务', '调度引擎', '充电控制', '计费系统', '统计分析']
         }
+    # 配置静态文件服务
+    @app.route('/')
+    @app.route('/<path:path>')
+    def serve_frontend(path=''):
+        """服务前端应用"""
+        if path and os.path.exists(os.path.join('static/dist', path)):
+            return app.send_static_file(f'dist/{path}')
+        return app.send_static_file('dist/index.html')
     
     return app, socketio
 

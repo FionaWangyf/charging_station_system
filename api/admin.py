@@ -7,37 +7,16 @@ from functools import wraps
 # 创建蓝图
 admin_bp = Blueprint('admin', __name__)
 
-def login_required(f):
-    """登录验证装饰器"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'user_id' not in session:
-            return error_response("请先登录", code=401, error_type="LOGIN_REQUIRED")
-        return f(*args, **kwargs)
-    return decorated_function
-
+# 移除管理员验证装饰器，直接返回原函数
 def admin_required(f):
-    """管理员权限验证装饰器"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'user_id' not in session:
-            return error_response("请先登录", code=401, error_type="LOGIN_REQUIRED")
-        
-        user_type = session.get('user_type')
-        if user_type != 'admin':
-            return error_response("需要管理员权限", code=403, error_type="PERMISSION_DENIED")
-        
-        return f(*args, **kwargs)
-    return decorated_function
+    return f
 
 @admin_bp.route('/test', methods=['GET'])
-@admin_required
 def test():
     """测试接口"""
     return success_response(data={'message': '管理员API正常运行'})
 
 @admin_bp.route('/pile/start', methods=['POST'])
-@admin_required
 def start_pile():
     """启动指定充电桩"""
     try:
