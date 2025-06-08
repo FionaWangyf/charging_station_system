@@ -8,32 +8,24 @@ pip install -r requirements.txt
 2. 运行项目
 python app.py
 
-3. 访问测试
-# http://localhost:5000
+3. 打开两个新的命令行
 
+命令行1-运行客户端
+cd frontend/user
+npm run build
+npm run dev
+
+命令行2-运行管理员端
+cd frontend/admin
+npm run build
+npm run dev
+
+3. 访问测试
+用户端
+# http://localhost:5001/user
+管理员端
+# http://localhost:5173/
 ```
-charging_station_system
-├─ 📁__pycache__
-├─ 📁api
-│  ├─ 📁__pycache__
-│  ├─ 📄__init__.py
-│  ├─ 📄admin.py
-│  ├─ 📄charging.py
-│  └─ 📄user.py
-├─ 📁database
-│  ├─ 📁__pycache__
-│  └─ 📄init_db.py
-├─ 📁models
-│  ├─ 📁__pycache__
-│  └─ 📄user.py
-├─ 📁utils
-│  ├─ 📁__pycache__
-│  ├─ 📄response.py
-│  └─ 📄validators.py
-├─ 📄.env.example
-├─ 📄.gitignore
-├─ 📄README.md
-├─ 📄app.py
-├─ 📄config.py
-└─ 📄requirements.txt
-```
+
+在.env中配置自己的数据库用户名、密码等敏感信息 \
+提前创建好数据库
