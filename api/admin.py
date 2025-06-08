@@ -50,8 +50,7 @@ def start_pile():
             return error_response("充电桩ID不能为空")
         
         from models.billing import ChargingPile
-        from scheduler_core import PileType, PileStatus as EnginePileStatus, Pile
-        import scheduler_core
+        from models.user import db
         
         # 检查充电桩是否存在
         pile = ChargingPile.query.get(pile_id)
@@ -64,28 +63,37 @@ def start_pile():
         # 更新数据库状态
         pile.status = 'available'
         
-        # 添加到调度引擎
-        # 根据scheduler_core定义：D=直流(快充), A=交流(慢充)
-        engine_pile_type = PileType.D if pile.pile_type == 'fast' else PileType.A
-        pile_for_engine = Pile(
-            pile_id=pile.id,
-            type=engine_pile_type,
-            max_kw=float(pile.power_rating),
-            status=EnginePileStatus.IDLE
-        )
-        
+        # 尝试添加到调度引擎
         try:
+            import scheduler_core
+            from scheduler_core import PileType, PileStatus, Pile as EnginePile
+            
+            # 根据scheduler_core定义：D=直流(快充), A=交流(慢充)
+            engine_pile_type = PileType.D if pile.pile_type == 'fast' else PileType.A
+            pile_for_engine = EnginePile(
+                pile_id=pile.id,
+                type=engine_pile_type,
+                max_kw=float(pile.power_rating),
+                status=PileStatus.IDLE
+            )
+            
             scheduler_core.add_pile(pile_for_engine)
+            print(f"✅ 充电桩 {pile_id} 已添加到调度引擎")
+            
         except Exception as e:
-            print(f"添加充电桩到引擎失败: {e}")
+            print(f"⚠️ 添加充电桩到引擎失败: {e}")
+            # 继续执行，不阻断流程
         
         # 更新Redis状态
-        charging_service = current_app.extensions.get('charging_service')
-        if charging_service:
-            charging_service.update_pile_redis_status(pile_id, EnginePileStatus.IDLE.value, None)
-            charging_service.broadcast_status_update()
+        try:
+            charging_service = current_app.extensions.get('charging_service')
+            if charging_service:
+                from scheduler_core import PileStatus as EnginePileStatus
+                charging_service.update_pile_redis_status(pile_id, EnginePileStatus.IDLE.value, None)
+                charging_service.broadcast_status_update()
+        except Exception as e:
+            print(f"⚠️ 更新Redis状态失败: {e}")
         
-        from models.user import db
         db.session.commit()
         
         return success_response(data={
@@ -96,8 +104,10 @@ def start_pile():
     except Exception as e:
         from models.user import db
         db.session.rollback()
-        print(f"启动充电桩错误: {e}")
-        return error_response("系统错误", code=500)
+        print(f"❌ 启动充电桩错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return error_response(f"启动充电桩失败: {str(e)}", code=500)
 
 @admin_bp.route('/pile/stop', methods=['POST'])
 @admin_required
@@ -116,21 +126,24 @@ def stop_pile():
         
         from models.billing import ChargingPile
         from models.charging import ChargingSession, ChargingStatus
-        from scheduler_core import PileType
-        import scheduler_core
+        from models.user import db
+        
+        print(f"🔧 开始关闭充电桩: {pile_id}, 强制: {force}")
         
         # 检查充电桩状态
         pile = ChargingPile.query.get(pile_id)
         if not pile:
             return error_response("充电桩不存在", code=404)
         
-        if pile.status == 'offline':
+        if pile.status == 'maintenance':
             return error_response("充电桩已经离线", code=400)
         
         # 检查是否有正在充电的会话
         active_sessions = ChargingSession.query.filter_by(pile_id=pile_id)\
             .filter(ChargingSession.status.in_([ChargingStatus.CHARGING, ChargingStatus.COMPLETING]))\
             .all()
+        
+        print(f"📊 发现 {len(active_sessions)} 个活跃充电会话")
         
         if active_sessions and not force:
             session_info = []
@@ -141,48 +154,74 @@ def stop_pile():
                     'status': session.status.value
                 })
             return error_response(
-                "充电桩有正在进行的充电会话，请先完成或强制关闭",
+                f"充电桩有 {len(active_sessions)} 个正在进行的充电会话，请先完成或强制关闭",
                 code=400
             )
         
         # 如果强制关闭，先结束所有活跃会话
+        ended_sessions = 0
         if active_sessions and force:
+            print(f"🛑 强制关闭 {len(active_sessions)} 个活跃会话")
             for session in active_sessions:
-                print(f"强制关闭充电桩 {pile_id}，结束会话 {session.session_id}")
                 try:
-                    scheduler_core.end_charging(pile_id)
+                    # 更新会话状态为取消
+                    session.status = ChargingStatus.CANCELLED
+                    session.end_time = datetime.now()
+                    ended_sessions += 1
+                    print(f"   ✅ 已取消会话: {session.session_id}")
+                    
                 except Exception as e:
-                    print(f"结束充电时出错: {e}")
+                    print(f"   ❌ 取消会话失败: {session.session_id} - {e}")
         
         # 更新数据库状态
-        pile.status = 'offline'
+        pile.status = 'maintenance'  # 使用 maintenance 代替 offline
+        print(f"📝 更新充电桩 {pile_id} 状态为 maintenance")
         
-        # 从调度引擎移除
+        # 尝试从调度引擎移除
         try:
-            scheduler_core.remove_pile(pile_id)
-        except (AttributeError, Exception) as e:
-            print(f"从引擎移除充电桩失败: {e}")
+            import scheduler_core
+            
+            # 检查调度引擎是否有对应方法
+            if hasattr(scheduler_core, 'remove_pile'):
+                scheduler_core.remove_pile(pile_id)
+                print(f"✅ 从调度引擎移除充电桩: {pile_id}")
+            elif hasattr(scheduler_core, 'mark_fault'):
+                # 如果没有remove_pile，使用mark_fault来停用
+                scheduler_core.mark_fault(pile_id)
+                print(f"✅ 在调度引擎中标记充电桩故障: {pile_id}")
+            else:
+                print(f"⚠️ 调度引擎没有相关移除方法，跳过")
+                
+        except Exception as e:
+            print(f"⚠️ 从调度引擎移除充电桩失败: {e}")
+            # 继续执行，不阻断流程
         
         # 更新Redis状态
-        charging_service = current_app.extensions.get('charging_service')
-        if charging_service:
-            charging_service.update_pile_redis_status(pile_id, 'offline', None)
-            charging_service.broadcast_status_update()
+        try:
+            charging_service = current_app.extensions.get('charging_service')
+            if charging_service:
+                charging_service.update_pile_redis_status(pile_id, 'offline', None)
+                charging_service.broadcast_status_update()
+                print(f"✅ 更新Redis状态: {pile_id} -> offline")
+        except Exception as e:
+            print(f"⚠️ 更新Redis状态失败: {e}")
         
-        from models.user import db
         db.session.commit()
+        print(f"✅ 数据库更改已提交")
         
         return success_response(data={
             'pile_id': pile_id,
             'status': 'offline',
-            'forced_stop_sessions': len(active_sessions) if force else 0
-        }, message=f'充电桩 {pile_id} 已关闭')
+            'forced_stop_sessions': ended_sessions
+        }, message=f'充电桩 {pile_id} 已关闭' + (f'，强制停止了 {ended_sessions} 个会话' if ended_sessions > 0 else ''))
     
     except Exception as e:
         from models.user import db
         db.session.rollback()
-        print(f"关闭充电桩错误: {e}")
-        return error_response("系统错误", code=500)
+        print(f"❌ 关闭充电桩错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return error_response(f"关闭充电桩失败: {str(e)}", code=500)
 
 @admin_bp.route('/piles/status', methods=['GET'])
 @admin_required
@@ -191,7 +230,6 @@ def get_all_piles_status():
     try:
         from models.billing import ChargingPile
         from models.charging import ChargingSession, ChargingStatus
-        from core import scheduler_core
         
         # 获取所有充电桩
         piles = ChargingPile.query.order_by(ChargingPile.id).all()
@@ -204,8 +242,11 @@ def get_all_piles_status():
             
             # 获取Redis中的实时状态
             redis_status = {}
-            if charging_service:
-                redis_status = charging_service.redis_client.hgetall(f"pile_status:{pile_id}")
+            if charging_service and charging_service.redis_client:
+                try:
+                    redis_status = charging_service.redis_client.hgetall(f"pile_status:{pile_id}")
+                except Exception as e:
+                    print(f"⚠️ 获取Redis状态失败: {e}")
             
             current_session_id = redis_status.get('current_charging_session_id', '')
             
@@ -218,14 +259,15 @@ def get_all_piles_status():
             engine_status = None
             engine_estimated_end = None
             try:
+                import scheduler_core
                 all_engine_piles = scheduler_core.get_all_piles()
                 for engine_pile in all_engine_piles:
                     if engine_pile.pile_id == pile_id:
                         engine_status = engine_pile.status.value
                         engine_estimated_end = engine_pile.estimated_end.isoformat() if engine_pile.estimated_end else None
                         break
-            except (AttributeError, Exception):
-                pass
+            except Exception as e:
+                print(f"⚠️ 获取引擎状态失败: {e}")
             
             pile_info = {
                 'id': pile_id,
@@ -267,18 +309,16 @@ def get_all_piles_status():
         }, message="获取充电桩状态成功")
     
     except Exception as e:
-        print(f"获取充电桩状态错误: {e}")
+        print(f"❌ 获取充电桩状态错误: {e}")
         import traceback
         traceback.print_exc()
-        return error_response("系统错误", code=500)
+        return error_response(f"获取充电桩状态失败: {str(e)}", code=500)
 
 @admin_bp.route('/queue/info', methods=['GET'])
 @admin_required
 def get_queue_info():
     """获取所有等候队列中的车辆信息"""
     try:
-        from scheduler_core import PileType
-        import scheduler_core
         import json
         
         charging_service = current_app.extensions.get('charging_service')
@@ -298,25 +338,31 @@ def get_queue_info():
         }
         
         # 1. 获取充电站等候区信息
-        for mode in ['fast', 'trickle']:
-            station_queue_key = f"station_waiting_area:{mode}"
-            queue_items = charging_service.redis_client.lrange(station_queue_key, 0, -1)
-            
-            for idx, item_json in enumerate(queue_items):
-                item = json.loads(item_json)
-                queue_info['station_waiting_area'][mode].append({
-                    'position': idx + 1,
-                    'session_id': item['session_id'],
-                    'user_id': item['user_id'],
-                    'requested_amount': float(item['requested_amount']),
-                    'created_at': item['created_at'],
-                    'waiting_time_minutes': (datetime.now() - datetime.fromisoformat(item['created_at'])).total_seconds() / 60
-                })
+        try:
+            for mode in ['fast', 'trickle']:
+                station_queue_key = f"station_waiting_area:{mode}"
+                queue_items = charging_service.redis_client.lrange(station_queue_key, 0, -1)
+                
+                for idx, item_json in enumerate(queue_items):
+                    item = json.loads(item_json)
+                    queue_info['station_waiting_area'][mode].append({
+                        'position': idx + 1,
+                        'session_id': item['session_id'],
+                        'user_id': item['user_id'],
+                        'requested_amount': float(item['requested_amount']),
+                        'created_at': item['created_at'],
+                        'waiting_time_minutes': (datetime.now() - datetime.fromisoformat(item['created_at'])).total_seconds() / 60
+                    })
+        except Exception as e:
+            print(f"⚠️ 获取充电站等候区信息失败: {e}")
         
         # 2. 获取引擎调度队列信息
         try:
-            fast_engine_queue = scheduler_core.get_waiting_list(PileType.D.value, n=-1)  # 使用.value
-            trickle_engine_queue = scheduler_core.get_waiting_list(PileType.A.value, n=-1)  # 使用.value
+            import scheduler_core
+            from scheduler_core import PileType
+            
+            fast_engine_queue = scheduler_core.get_waiting_list(PileType.D.value, n=-1)
+            trickle_engine_queue = scheduler_core.get_waiting_list(PileType.A.value, n=-1)
             
             for idx, req in enumerate(fast_engine_queue):
                 queue_info['engine_dispatch_queues']['fast'].append({
@@ -340,45 +386,49 @@ def get_queue_info():
                     'waiting_time_minutes': (datetime.now() - req.generated_at).total_seconds() / 60 if req.generated_at else 0
                 })
         
-        except (AttributeError, Exception) as e:
-            print(f"获取引擎队列信息失败: {e}")
+        except Exception as e:
+            print(f"⚠️ 获取引擎队列信息失败: {e}")
         
         # 3. 获取正在充电的会话信息
-        from models.charging import ChargingSession, ChargingStatus
-        from models.billing import ChargingPile
-        from models.user import db
-        
-        charging_sessions = db.session.query(ChargingSession)\
-            .join(ChargingPile, ChargingSession.pile_id == ChargingPile.id)\
-            .filter(ChargingSession.status.in_([ChargingStatus.CHARGING, ChargingStatus.COMPLETING]))\
-            .order_by(ChargingSession.start_time.desc()).all()
-        
-        for session in charging_sessions:
-            session_info = {
-                'session_id': session.session_id,
-                'user_id': session.user_id,
-                'pile_id': session.pile_id,
-                'pile_type': session.pile.pile_type,
-                'pile_power': float(session.pile.power_rating),
-                'requested_amount': float(session.requested_amount),
-                'actual_amount': float(session.actual_amount or 0),
-                'progress_percentage': (float(session.actual_amount or 0) / float(session.requested_amount)) * 100,
-                'start_time': session.start_time.isoformat() if session.start_time else None,
-                'charging_duration_hours': float(session.charging_duration or 0),
-                'status': session.status.value
-            }
+        try:
+            from models.charging import ChargingSession, ChargingStatus
+            from models.billing import ChargingPile
+            from models.user import db
             
-            # 计算预估剩余时间
-            if session.start_time and session.status == ChargingStatus.CHARGING:
-                remaining_kwh = float(session.requested_amount) - float(session.actual_amount or 0)
-                pile_power = float(session.pile.power_rating)
-                if pile_power > 0 and remaining_kwh > 0:
-                    estimated_remaining_hours = remaining_kwh / pile_power
-                    session_info['estimated_remaining_hours'] = round(estimated_remaining_hours, 2)
-                else:
-                    session_info['estimated_remaining_hours'] = 0
+            charging_sessions = db.session.query(ChargingSession)\
+                .join(ChargingPile, ChargingSession.pile_id == ChargingPile.id)\
+                .filter(ChargingSession.status.in_([ChargingStatus.CHARGING, ChargingStatus.COMPLETING]))\
+                .order_by(ChargingSession.start_time.desc()).all()
             
-            queue_info['charging_sessions'].append(session_info)
+            for session in charging_sessions:
+                session_info = {
+                    'session_id': session.session_id,
+                    'user_id': session.user_id,
+                    'pile_id': session.pile_id,
+                    'pile_type': session.pile.pile_type,
+                    'pile_power': float(session.pile.power_rating),
+                    'requested_amount': float(session.requested_amount),
+                    'actual_amount': float(session.actual_amount or 0),
+                    'progress_percentage': (float(session.actual_amount or 0) / float(session.requested_amount)) * 100,
+                    'start_time': session.start_time.isoformat() if session.start_time else None,
+                    'charging_duration_hours': float(session.charging_duration or 0),
+                    'status': session.status.value
+                }
+                
+                # 计算预估剩余时间
+                if session.start_time and session.status == ChargingStatus.CHARGING:
+                    remaining_kwh = float(session.requested_amount) - float(session.actual_amount or 0)
+                    pile_power = float(session.pile.power_rating)
+                    if pile_power > 0 and remaining_kwh > 0:
+                        estimated_remaining_hours = remaining_kwh / pile_power
+                        session_info['estimated_remaining_hours'] = round(estimated_remaining_hours, 2)
+                    else:
+                        session_info['estimated_remaining_hours'] = 0
+                
+                queue_info['charging_sessions'].append(session_info)
+        
+        except Exception as e:
+            print(f"⚠️ 获取充电会话信息失败: {e}")
         
         # 4. 汇总统计
         summary = {
@@ -398,10 +448,10 @@ def get_queue_info():
         }, message="获取队列信息成功")
     
     except Exception as e:
-        print(f"获取队列信息错误: {e}")
+        print(f"❌ 获取队列信息错误: {e}")
         import traceback
         traceback.print_exc()
-        return error_response("系统错误", code=500)
+        return error_response(f"获取队列信息失败: {str(e)}", code=500)
 
 @admin_bp.route('/overview', methods=['GET'])
 @admin_required
@@ -411,13 +461,12 @@ def get_system_overview():
         from models.billing import ChargingPile
         from models.charging import ChargingSession, ChargingStatus
         from models.user import db, User
-        from scheduler_core import PileType
-        import scheduler_core
+        from sqlalchemy import func
         
         # 充电桩状态统计
         pile_status_stats = db.session.query(
             ChargingPile.status,
-            db.func.count(ChargingPile.id).label('count')
+            func.count(ChargingPile.id).label('count')
         ).group_by(ChargingPile.status).all()
         
         pile_status_counts = {row.status: row.count for row in pile_status_stats}
@@ -427,9 +476,9 @@ def get_system_overview():
         tomorrow_start = today_start + timedelta(days=1)
         
         today_stats = db.session.query(
-            db.func.count(ChargingSession.id).label('today_sessions'),
-            db.func.sum(ChargingSession.actual_amount).label('today_amount'),
-            db.func.sum(ChargingSession.total_fee).label('today_revenue')
+            func.count(ChargingSession.id).label('today_sessions'),
+            func.sum(ChargingSession.actual_amount).label('today_amount'),
+            func.sum(ChargingSession.total_fee).label('today_revenue')
         ).filter(
             ChargingSession.start_time >= today_start,
             ChargingSession.start_time < tomorrow_start,
@@ -444,9 +493,9 @@ def get_system_overview():
             next_month_start = month_start.replace(month=month_start.month + 1)
         
         month_stats = db.session.query(
-            db.func.count(ChargingSession.id).label('month_sessions'),
-            db.func.sum(ChargingSession.actual_amount).label('month_amount'),
-            db.func.sum(ChargingSession.total_fee).label('month_revenue')
+            func.count(ChargingSession.id).label('month_sessions'),
+            func.sum(ChargingSession.actual_amount).label('month_amount'),
+            func.sum(ChargingSession.total_fee).label('month_revenue')
         ).filter(
             ChargingSession.start_time >= month_start,
             ChargingSession.start_time < next_month_start,
@@ -462,15 +511,17 @@ def get_system_overview():
             'engine_trickle_queue': 0
         }
         
-        if charging_service:
-            queue_stats['station_waiting_fast'] = charging_service.redis_client.llen('station_waiting_area:fast')
-            queue_stats['station_waiting_trickle'] = charging_service.redis_client.llen('station_waiting_area:trickle')
-            
+        if charging_service and charging_service.redis_client:
             try:
-                queue_stats['engine_fast_queue'] = len(scheduler_core.get_waiting_list(PileType.D.value))  # 使用.value
-                queue_stats['engine_trickle_queue'] = len(scheduler_core.get_waiting_list(PileType.A.value))  # 使用.value
-            except:
-                pass
+                queue_stats['station_waiting_fast'] = charging_service.redis_client.llen('station_waiting_area:fast')
+                queue_stats['station_waiting_trickle'] = charging_service.redis_client.llen('station_waiting_area:trickle')
+                
+                import scheduler_core
+                from scheduler_core import PileType
+                queue_stats['engine_fast_queue'] = len(scheduler_core.get_waiting_list(PileType.D.value))
+                queue_stats['engine_trickle_queue'] = len(scheduler_core.get_waiting_list(PileType.A.value))
+            except Exception as e:
+                print(f"⚠️ 获取队列统计失败: {e}")
         
         # 正在充电的会话数
         active_charging = ChargingSession.query.filter(
@@ -507,4 +558,7 @@ def get_system_overview():
         return success_response(data=overview, message="获取系统概览成功")
     
     except Exception as e:
-        print(f"获取系统概览失败: {e}")
+        print(f"❌ 获取系统概览失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return error_response(f"获取系统概览失败: {str(e)}", code=500)
