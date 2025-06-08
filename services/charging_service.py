@@ -587,84 +587,60 @@ class ChargingService:
                 self.update_pile_redis_status(pile_id, PileStatus.IDLE.value, None)
                 return
             
-            # 确定最终状态
-            current_status = session.status
-            final_status = ChargingStatus.COMPLETED
-            
-            if current_status == ChargingStatus.CANCELLING_AFTER_DISPATCH or not graceful_end:
-                final_status = ChargingStatus.CANCELLED
-            
-            # 计算费用
-            actual_amount = float(session.actual_amount or 0)
-            charging_duration_hours = float(session.charging_duration or 0)
-            
-            fees = self.calculate_charging_fees(
-                session_id, 
-                actual_amount, 
-                session.start_time, 
-                datetime.now()
-            )
-            
-            # 更新会话
-            session.status = final_status
-            session.end_time = datetime.now()
-            session.charging_fee = fees['charging_fee']
-            session.service_fee = fees['service_fee']
-            session.total_fee = fees['total_fee']
-            session.actual_amount = actual_amount
-            session.charging_duration = charging_duration_hours
-            
-            # 更新充电桩统计
-            if session.pile:
-                session.pile.total_charges += 1
-                session.pile.total_power += Decimal(str(actual_amount))
-                session.pile.total_revenue += Decimal(str(fees['total_fee']))
-            
-            # 🔧 新增：创建计费记录
-            if final_status == ChargingStatus.COMPLETED and actual_amount > 0:
-                try:
-                    from services.billing_service import BillingService
-                    
-                    billing_record = BillingService.create_charging_record(
-                        user_id=session.user_id,
-                        pile_id=pile_id,
-                        start_time=session.start_time,
-                        end_time=session.end_time or datetime.now(),
-                        power_consumed=actual_amount
-                    )
-                    
-                    if billing_record:
-                        print(f"✅ 创建计费记录: ID={billing_record.id}, 费用={billing_record.total_fee}元")
-                    else:
-                        print(f"⚠️ 计费记录创建失败")
-                        
-                except Exception as billing_error:
-                    print(f"❌ 创建计费记录时出错: {billing_error}")
-                    import traceback
-                    traceback.print_exc()
-            
-            db.session.commit()
-            
-            # 更新状态
-            self.update_pile_redis_status(pile_id, PileStatus.IDLE.value, None)
-            self.redis_client.delete(f"session_status:{session_id}")
-            
-            # WebSocket通知
-            if self.socketio:
-                msg = f"您的充电请求 {session.queue_number} ({session_id}) 已在充电桩 {pile_id} {final_status.value}。总费用: {fees['total_fee']:.2f}元。"
-                self.socketio.emit('user_specific_event', {
-                    'message': msg, 
-                    'type': 'charging_ended', 
-                    'session_id': session_id,
-                    'pile_id': pile_id, 
-                    'total_fee': fees['total_fee'], 
-                    'status': final_status.value,
-                    'actual_amount': actual_amount, 
-                    'charging_duration': charging_duration_hours
-                }, room=f'user_{session.user_id}')
-            
-            # 触发下一轮处理
-            self.process_station_waiting_area_to_engine()
+            try:
+                # 确定最终状态
+                current_status = session.status
+                final_status = ChargingStatus.COMPLETED
+                
+                if current_status == ChargingStatus.CANCELLING_AFTER_DISPATCH or not graceful_end:
+                    final_status = ChargingStatus.CANCELLED
+                
+                # 计算费用
+                actual_amount = float(session.actual_amount or 0)
+                charging_duration_hours = float(session.charging_duration or 0)
+                
+                fees = self.calculate_charging_fees(
+                    session_id, 
+                    actual_amount, 
+                    session.start_time, 
+                    datetime.now()
+                )
+                
+                # 更新会话
+                session.status = final_status
+                session.end_time = datetime.now()
+                session.charging_fee = fees['charging_fee']
+                session.service_fee = fees['service_fee']
+                session.total_fee = fees['total_fee']
+                session.actual_amount = actual_amount
+                session.charging_duration = charging_duration_hours
+                
+                # 确保更新到数据库
+                db.session.commit()
+                
+                # 清理Redis中的会话状态
+                self.redis_client.delete(f"session_status:{session_id}")
+                
+                # 更新充电桩状态
+                self.update_pile_redis_status(pile_id, PileStatus.IDLE.value, None)
+                
+                # WebSocket通知
+                if self.socketio:
+                    self.socketio.emit('user_specific_event', {
+                        'message': f'充电会话 {session_id} 已结束',
+                        'type': 'charging_ended',
+                        'session_id': session_id,
+                        'status': final_status.value,
+                        'end_time': session.end_time.isoformat()
+                    }, room=f'user_{session.user_id}')
+                
+                print(f"✅ 会话 {session_id} 状态已更新为 {final_status.value}")
+                
+            except Exception as e:
+                db.session.rollback()
+                print(f"❌ 更新会话状态失败: {e}")
+                import traceback
+                traceback.print_exc()
     
     def handle_pile_end_without_session_id(self, pile_id: str):
         """处理只有pile_id的充电结束事件"""
@@ -742,113 +718,78 @@ class ChargingService:
             self.process_station_waiting_area_to_engine()
     
     def check_and_recover_timeout_completing_sessions(self):
-        """检查和恢复超时的completing状态会话"""
+        """检查并恢复超时的completing会话"""
         if not self._initialized:
             return
             
-        lock_key = "timeout_check_lock"
-        
-        if not self.redis_client.set(lock_key, "processing", nx=True, ex=15):
-            return
-        
         try:
-            timeout_threshold = datetime.now() - timedelta(seconds=60)
-            
-            timeout_sessions = ChargingSession.query.filter(
-                ChargingSession.status == ChargingStatus.COMPLETING,
-                ChargingSession.start_time < timeout_threshold
-            ).all()
-            
-            if not timeout_sessions:
-                return
-            
-            print(f"🕐 发现 {len(timeout_sessions)} 个超时的completing会话，开始恢复...")
-            
-            recovered_count = 0
-            for session in timeout_sessions:
-                # 双重检查状态
-                if session.status != ChargingStatus.COMPLETING:
-                    continue
+            with self.lock:
+                # 查找所有completing状态的会话
+                completing_sessions = ChargingSession.query.filter_by(
+                    status=ChargingStatus.COMPLETING
+                ).all()
                 
-                print(f"🔄 恢复超时会话: {session.session_id}")
+                if not completing_sessions:
+                    return
                 
-                actual_amount = float(session.actual_amount or 0)
-                fees = self.calculate_charging_fees(
-                    session.session_id,
-                    actual_amount,
-                    session.start_time,
-                    datetime.now()
-                )
+                print(f"🕐 发现 {len(completing_sessions)} 个超时的completing会话，开始恢复...")
                 
-                session.status = ChargingStatus.COMPLETED
-                session.end_time = datetime.now()
-                session.charging_fee = fees['charging_fee']
-                session.service_fee = fees['service_fee']
-                session.total_fee = fees['total_fee']
-                
-                recovered_count += 1
-                
-                # 🔧 新增：为恢复的会话创建计费记录
-                if actual_amount > 0:
+                for session in completing_sessions:
                     try:
-                        from services.billing_service import BillingService
+                        print(f"🔄 恢复超时会话: {session.session_id}")
                         
-                        billing_record = BillingService.create_charging_record(
-                            user_id=session.user_id,
-                            pile_id=session.pile_id or 'UNKNOWN',
-                            start_time=session.start_time,
-                            end_time=session.end_time,
-                            power_consumed=actual_amount
+                        # 计算费用
+                        actual_amount = float(session.actual_amount or 0)
+                        fees = self.calculate_charging_fees(
+                            session.session_id,
+                            actual_amount,
+                            session.start_time,
+                            datetime.now()
                         )
                         
-                        if billing_record:
-                            print(f"✅ 为恢复会话创建计费记录: ID={billing_record.id}")
-                        else:
-                            print(f"⚠️ 恢复会话计费记录创建失败")
-                            
-                    except Exception as billing_error:
-                        print(f"❌ 创建恢复会话计费记录时出错: {billing_error}")
+                        # 更新会话状态
+                        session.status = ChargingStatus.COMPLETED
+                        session.end_time = datetime.now()
+                        session.charging_fee = fees['charging_fee']
+                        session.service_fee = fees['service_fee']
+                        session.total_fee = fees['total_fee']
+                        
+                        # 创建计费记录
+                        if actual_amount > 0:
+                            from services.billing_service import BillingService
+                            billing_record = BillingService.create_charging_record(
+                                user_id=session.user_id,
+                                pile_id=session.pile_id,
+                                start_time=session.start_time,
+                                end_time=session.end_time,
+                                power_consumed=actual_amount
+                            )
+                            if billing_record:
+                                print(f"✅ 为恢复会话创建计费记录: ID={billing_record.id}")
+                        
+                        # 清理Redis状态
+                        self.redis_client.delete(f"session_status:{session.session_id}")
+                        self.redis_client.delete(f"session_completing:{session.session_id}")
+                        
+                        # 更新充电桩状态
+                        if session.pile_id:
+                            self.update_pile_redis_status(session.pile_id, PileStatus.IDLE.value, None)
+                        
+                        print(f"✅ 会话 {session.session_id} 已恢复为完成状态")
+                        
+                    except Exception as session_error:
+                        print(f"❌ 恢复会话 {session.session_id} 失败: {session_error}")
+                        continue
                 
-                # 更新充电桩统计
-                if session.pile:
-                    session.pile.total_charges += 1
-                    session.pile.total_power += Decimal(str(actual_amount))
-                    session.pile.total_revenue += Decimal(str(fees['total_fee']))
-                    
-                    try:
-                        scheduler_core.end_charging(session.pile_id)
-                    except:
-                        pass
-                    
-                    self.update_pile_redis_status(session.pile_id, PileStatus.IDLE.value, None)
-                
-                # 清理Redis
-                self.redis_client.delete(f"session_status:{session.session_id}")
-                self.redis_client.delete(f"session_completing:{session.session_id}")
-                
-                # 通知用户
-                if self.socketio:
-                    self.socketio.emit('user_specific_event', {
-                        'message': f'您的充电会话已完成。总费用: {fees["total_fee"]:.2f}元。',
-                        'type': 'charging_completed_recovery',
-                        'session_id': session.session_id,
-                        'total_fee': fees['total_fee'],
-                        'actual_amount': actual_amount
-                    }, room=f'user_{session.user_id}')
-            
-            if recovered_count > 0:
+                # 提交所有更改
                 db.session.commit()
-                print(f"✅ 成功恢复了 {recovered_count} 个超时会话")
-                self.broadcast_status_update()
-                self.process_station_waiting_area_to_engine()
-            
+                print(f"✅ 成功恢复了 {len(completing_sessions)} 个超时会话")
+                
         except Exception as e:
             db.session.rollback()
-            print(f"❌ 检查超时completing会话错误: {e}")
+            print(f"❌ 检查超时会话失败: {e}")
             import traceback
             traceback.print_exc()
-        finally:
-            self.redis_client.delete(lock_key)
     
     def force_sync_engine_pile_states(self):
         """强制同步引擎与应用的充电桩状态"""
@@ -1267,3 +1208,6 @@ class ChargingService:
             import traceback
             traceback.print_exc()
             return {'success': False, 'message': '系统错误，请稍后重试', 'code': 5001}
+        
+    def _map_charging_mode_to_engine_piletype(self, charging_mode: str) -> PileType:
+        return PileType.D if charging_mode == 'fast' else PileType.A

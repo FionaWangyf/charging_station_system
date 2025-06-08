@@ -97,6 +97,30 @@ class StressTester:
     
     async def submit_charging_request(self, session, user_data):
         """提交充电请求"""
+        # 首先检查并清理已有的充电会话
+        try:
+            async with session.get(
+                f"{self.base_url}/api/charging/status",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('data', {}).get('has_active_request'):
+                        session_id = data['data'].get('session_id')
+                        if session_id:
+                            # 取消已有的充电请求
+                            await session.post(
+                                f"{self.base_url}/api/charging/request/cancel",
+                                json={"session_id": session_id},
+                                timeout=aiohttp.ClientTimeout(total=5)
+                            )
+                            self.log(f"已取消用户 {user_data['username']} 的已有充电请求: {session_id}")
+                            # 等待一小段时间确保取消操作完成
+                            await asyncio.sleep(1)
+        except Exception as e:
+            self.log(f"检查/清理已有会话时出错: {str(e)}")
+
+        # 提交新的充电请求
         charging_modes = ["fast", "trickle"]
         charging_mode = random.choice(charging_modes)
         requested_amount = random.uniform(10.0, 50.0)

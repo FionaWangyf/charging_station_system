@@ -24,7 +24,17 @@ def test():
 @login_required
 def submit_charging_request():
     """用户提交充电请求"""
+    
     try:
+        # 添加充电服务状态检查
+        charging_service = current_app.extensions.get('charging_service')
+        if not charging_service:
+            return error_response("充电服务不可用", code=503)
+        
+        # 检查初始化状态
+        if not hasattr(charging_service, '_initialized') or not charging_service._initialized:
+            return error_response("充电服务正在初始化中，请稍后重试", code=503)
+        
         user_id = session.get('user_id')
         data = request.get_json()
         
